@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { Store } from '../src/store.mjs';
+import packageJson from '../package.json' with { type: 'json' };
 
 const DAY = 86_400_000;
 function fixture(t) {
@@ -29,6 +30,27 @@ function revealed(store, key) {
   return id;
 }
 const readAction = { action_id: 'read', model: 'synthetic-model', source: { display: 'Synthetic source' } };
+
+test('package runtime contract requires Node 24.5 or later', () => {
+  assert.equal(packageJson.engines.node, '>=24.5.0');
+});
+
+test('reading claims preserve original nonempty model values through the 256-character boundary', t => {
+  const { store } = fixture(t);
+  const models = ['vendor/token-model', 'password-model', 'api-key-model', '  selected-model  ', 'x'.repeat(256)];
+  for (const [index, model] of models.entries()) {
+    const sessionId = revealed(store, 'model' + index);
+    const claim = store.claimReading(sessionId, { ...readAction, model });
+    assert.equal(claim.attempt.model, model);
+    assert.equal(store.session(sessionId).reading.model, model);
+    assert.equal(store.claimReading(sessionId, { ...readAction, model }).claimed, false);
+  }
+  const sessionId = revealed(store, 'invalid-model');
+  for (const model of ['x'.repeat(257), '', ' \t\n', null, 1, {}]) {
+    assert.throws(() => store.claimReading(sessionId, { ...readAction, model }), /model/);
+    assert.equal(store.session(sessionId).reading, null);
+  }
+});
 
 test('global rolling policy persists across restart and excludes explicit manual invitations', t => {
   const f = fixture(t);

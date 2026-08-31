@@ -15,6 +15,16 @@ const draws = [{ position: 0, card_id: 'C1', reversed: false, revealed: true },
 const session = { id: 'session', conversation_id: 'conversation', revision: 3, phase: 'stopped',
   question: 'Synthetic question', spread_id: 'pair', draws, reading: null };
 
+test('original model metadata preserves keyword names and exact values up to 256 characters', () => {
+  for (const model of ['vendor/token-model', 'password-model', 'api-key-model', '  selected-model  ', 'x'.repeat(256)]) {
+    const result = buildResult({ ...session, reading: { id: 'attempt', state: 'failed', text: '', model } }, catalog);
+    assert.equal(result.source.model, model);
+  }
+  for (const model of ['x'.repeat(257), '', ' \t\n', null, 1, {}]) {
+    assert.throws(() => buildResult({ ...session, reading: { state: 'failed', text: '', model } }, catalog), /model/);
+  }
+});
+
 test('canonical draw takes labels only from original catalog and returns position sorted facts', () => {
   const result = canonicalDraw({ question: 'Question', spread_id: 'pair', draws: [
     { position: 1, card_id: 'C2', reversed: true, zh: 'fabricated' },

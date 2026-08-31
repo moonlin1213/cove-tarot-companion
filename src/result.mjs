@@ -75,12 +75,16 @@ export function extractSynthesis(text) {
 
 function originalSource(reading) {
   const source = { engine: 'tarot-ritual' };
-  for (const [key, value] of [['model', reading?.model], ['display', reading?.source?.display]]) {
-    if (value === undefined) continue;
-    boundedText(value, 160, `source ${key}`);
+  if (reading?.model !== undefined) {
+    if (typeof reading.model !== 'string' || !reading.model.trim() || reading.model.length > 256) fail('invalid model');
+    source.model = reading.model;
+  }
+  const value = reading?.source?.display;
+  if (value !== undefined) {
+    boundedText(value, 160, 'source display');
     if (!value.trim() || /[\u0000-\u001f\u007f]|:\/\/|www\.|\b(?:bearer|api[_-]?key|token|password)\b/i.test(value)) fail('invalid source');
-    if (key === 'display' && !/^[\p{L}\p{N} ._()·+-]+$/u.test(value)) fail('invalid source');
-    source[key] = value;
+    if (!/^[\p{L}\p{N} ._()·+-]+$/u.test(value)) fail('invalid source');
+    source.display = value;
   }
   return source;
 }

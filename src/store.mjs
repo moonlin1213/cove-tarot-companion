@@ -191,7 +191,9 @@ export class Store {
     return { ...row, source: JSON.parse(row.source) };
   }
   claimReading(sessionId, { action_id, model, source = {} }) {
-    id(action_id, 'action_id'); display(model, 'model'); source = safeSource(source);
+    id(action_id, 'action_id');
+    if (typeof model !== 'string' || !model.trim() || model.length > 256) fail('invalid model', 400);
+    source = safeSource(source);
     return this.#tx(() => {
       const row = this.#row(sessionId); this.#active(row);
       if (row.phase !== 'revealed') fail('reading requires revealed phase');
