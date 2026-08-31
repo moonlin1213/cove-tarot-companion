@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>塔罗邀请</title>
+<style>body{font:17px/1.7 system-ui,sans-serif;max-width:36rem;margin:12vh auto;padding:2rem;color:#292522;background:#faf8f3}button{font:inherit;padding:.6rem 1rem;margin:.5rem .7rem .5rem 0;cursor:pointer}small{color:#675f57}#status{min-height:2em}</style></head>
+<body><main><h1>要一起抽一组塔罗牌吗？</h1><p>接受后会打开原版塔罗仪式。你可以自行选择牌阵、问题与模型；没有可用模型时也可以仅抽牌，再带回已揭示的牌面事实。</p><p>接受邀请不会自动请求模型。解读可能产生你所选服务商的费用；本机 DSH 配置仅在你主动导入时读取。问题、抽牌及解读保存在本机，可停止或删除。</p><p>若这是恢复之前的邀请，接受会回到原有记录，不会重新抽牌或自动重新解读。</p><button id="accept">接受并打开</button><button id="reject">暂时不用</button><p id="status" role="status"></p><small>塔罗仅作反思与交流的参照，不替代医疗、法律或财务专业意见。返回后由当前对话的宿主读取结果；此页面不会擅自发送聊天消息。</small></main>
+<script type="application/json" id="invitation-config">INVITATION_CONFIG</script>
+<script>
+const config=JSON.parse(document.getElementById('invitation-config').textContent);
+for(const action of ['accept','reject'])document.getElementById(action).onclick=async()=>{
+  const status=document.getElementById('status');
+  document.querySelectorAll('button').forEach(button=>button.disabled=true);
+  try{
+    const response=await fetch('/companion/v1/invitations/'+config.id+'/'+action,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Companion-CSRF':config.csrf_token},body:'{}'});
+    if(!response.ok)throw new Error('操作未完成，请重新打开本次邀请后重试。');
+    const result=await response.json();
+    if(action==='accept')location.assign(result.url);else status.textContent='已婉拒。这次不会启动塔罗或模型。';
+  }catch(error){status.textContent=error.message;document.querySelectorAll('button').forEach(button=>button.disabled=false);}
+};
+</script></body></html>
