@@ -56,10 +56,11 @@ export class Store {
         UNIQUE(session_id,action_id)
       );
       CREATE TABLE IF NOT EXISTS deliveries (
-        event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id),
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id),
         conversation_id TEXT NOT NULL, revision INTEGER NOT NULL, requested_revision INTEGER NOT NULL,
         state TEXT NOT NULL, message_id TEXT
-      );`);
+      );
+      CREATE INDEX IF NOT EXISTS deliveries_conversation_sequence ON deliveries(conversation_id,sequence);`);
     this.#tx(() => {
       this.#db.exec(`UPDATE sessions SET revision=revision+1 WHERE id IN
         (SELECT session_id FROM readings WHERE state='running');
@@ -263,6 +264,29 @@ export class Store {
   }
   events(conversationId) {
     return this.#db.prepare('SELECT * FROM deliveries WHERE conversation_id=? ORDER BY rowid').all(id(conversationId, 'conversation_id')).map(row => this.#deliveryView(row));
+  }
+  /** Insertion-order pages use a non-recycling sequence, including across local
+   * deletion/reopen. Cursor is public position metadata, not authentication.
+   * Start a fresh traversal to reconcile state changes of previously seen IDs.
+   */
+  eventsPage(conversationId, { cursor, limit = 50 } = {}) {
+    id(conversationId, 'conversation_id');
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail('invalid limit', 400);
+    let sequence = 0;
+    if (cursor !== undefined) {
+      try {
+        if (typeof cursor !== 'string' || cursor.length > 512 || !/^[A-Za-z0-9_-]+$/.test(cursor)) throw new Error();
+        const decoded = Buffer.from(cursor, 'base64url');
+        if (decoded.toString('base64url') !== cursor) throw new Error();
+        const value = JSON.parse(decoded.toString('utf8'));
+        if (value.v !== 1 || value.c !== conversationId || !Number.isSafeInteger(value.s) || value.s < 0) throw new Error();
+        sequence = value.s;
+      } catch { fail('invalid cursor', 400); }
+    }
+    const rows = this.#db.prepare('SELECT * FROM deliveries WHERE conversation_id=? AND sequence>? ORDER BY sequence LIMIT ?').all(conversationId, sequence, limit + 1);
+    const has_more = rows.length > limit; const page = rows.slice(0, limit);
+    const next = page.at(-1)?.sequence ?? sequence;
+    return { events: page.map(row => this.#deliveryView(row)), next_cursor: Buffer.from(JSON.stringify({ v: 1, c: conversationId, s: next })).toString('base64url'), has_more };
   }
   claimDelivery(ref) {
     return this.#tx(() => {

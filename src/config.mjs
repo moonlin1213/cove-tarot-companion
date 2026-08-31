@@ -40,17 +40,23 @@ function validate(config, dataDir) {
   if (!path.isAbsolute(config.engineRoot) || !path.isAbsolute(config.executable)) throw new Error('Absolute engine and executable paths required');
   return { ...config, dataDir, origin: `http://127.0.0.1:${config.servicePort}` };
 }
+async function privateConfig(filename) {
+  const source = await secureFile(filename);
+  // JSON parser diagnostics can quote the input, which contains private tokens.
+  try { return JSON.parse(source); }
+  catch { throw new Error('Invalid private configuration JSON'); }
+}
 export async function loadConfig(dataDir = defaultDataDir()) {
   assertRuntime();
   dataDir = await privateDirectory(dataDir);
-  return validate(JSON.parse(await secureFile(path.join(dataDir, 'config.json'))), dataDir);
+  return validate(await privateConfig(path.join(dataDir, 'config.json')), dataDir);
 }
 export async function writeConfig(dataDir, changes) {
   assertRuntime();
   dataDir = await privateDirectory(dataDir);
   const filename = path.join(dataDir, 'config.json');
   let prior;
-  try { prior = JSON.parse(await secureFile(filename)); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  try { prior = await privateConfig(filename); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   const config = validate({ servicePort: 18642, enginePort: 18643, executable: process.execPath, installationId: randomBytes(16).toString('hex'),
     adminToken: randomBytes(32).toString('hex'), engineToken: randomBytes(32).toString('hex'), ...prior, ...changes }, dataDir);
   delete config.dataDir; delete config.origin;

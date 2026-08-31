@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import vm from 'node:vm';
 import { createService } from '../src/server.mjs';
 import { Store } from '../src/store.mjs';
 import { Engine } from '../src/engine.mjs';
@@ -19,6 +20,7 @@ async function fixture(t) {
   await fs.writeFile(path.join(root, 'private-secret'), 'DO NOT SERVE');
   await fs.symlink(path.join(root, 'private-secret'), path.join(publicDir, 'js/escape.js'));
   const calls = [];
+  const held = new Set(); let cancelled = 0;
   let mode = 'success';
   const upstream = http.createServer(async (req, res) => {
     let body = ''; for await (const chunk of req) body += chunk;
@@ -26,6 +28,11 @@ async function fixture(t) {
     if (req.url === '/api/dsh') return res.end('{"providers":[]}');
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write('data: {"t":"delta","v":"### 综合信息\\n原始解读。"}\n\n');
+    if (mode === 'hold') {
+      held.add(res);
+      await new Promise(resolve => res.once('close', () => { held.delete(res); cancelled++; resolve(); }));
+      return;
+    }
     await new Promise(r => setTimeout(r, 40));
     if (mode === 'error') res.write('data: {"t":"error","v":"synthetic-key-do-not-save"}\n\n');
     if (mode === 'oversize') res.write('data: ' + 'x'.repeat(140000));
@@ -36,6 +43,7 @@ async function fixture(t) {
   let starts = 0;
   const engine = { root, close: async () => {}, catalog: async () => ({ deck, spreads,
     buildReadingMessages: ({ question, placed }) => [{ role: 'system', content: 'Original builder' }, { role: 'user', content: question + ':' + placed[0].card.zh }],
+    buildIdentifyMessages: dataUrl => [{ role: 'user', content: [{ type: 'image_url', image_url: { url: dataUrl } }] }],
   }), request: (route, options) => { starts++; return fetch(`http://127.0.0.1:${upstream.address().port}${route}`, options); } };
   const config = { servicePort: 0, adminToken: 'synthetic-admin-secret', dataDir: root, installationId: 'synthetic-installation' };
   let service = await createService({ config, engine, store: () => new Store(path.join(root, 'state.sqlite')) });
@@ -77,7 +85,11 @@ async function fixture(t) {
     return accept({ id, cookie: page.headers.get('set-cookie').split(';')[0], csrf: initial.csrf_token });
   };
   const restart = async () => { await service.close(); service = await createService({ config, engine, store: () => new Store(path.join(root, 'state.sqlite')) }); };
-  return { root, origin, service, admin, invite, post, accept, revealed, session, calls, reenter, restart, starts: () => starts, mode: value => { mode = value; } };
+  const proxy = (client, route, body, cookie = client.cookie) => fetch(origin + route, { method: body ? 'POST' : 'GET', headers: {
+    connection: 'close', origin, cookie, 'x-tarot-request': '1', 'x-companion-session': client.id, ...(body ? { 'content-type': 'application/json' } : {}),
+  }, ...(body ? { body: JSON.stringify(body) } : {}) });
+  return { root, origin, service, admin, invite, post, accept, revealed, session, calls, reenter, restart, proxy,
+    starts: () => starts, mode: value => { mode = value; }, cancelled: () => cancelled, release: () => { for (const response of held) response.end(); } };
 }
 
 test('consent, exact origin/host, CSRF, scoped cookies and static containment protect records', async t => {
@@ -103,8 +115,78 @@ test('consent, exact origin/host, CSRF, scoped cookies and static containment pr
   for (const route of ['/js/escape.js', '/.git/config', '/config.json', '/js/%2e%2e/%2e%2e/private-secret']) assert.notEqual((await fetch(f.origin + route, { headers: { cookie: a.cookie } })).status, 200);
   assert.equal((await f.post(a, 'draw', { x: 'x'.repeat(70000) })).status, 413);
   assert.equal((await fetch(f.origin + '/api/dsh')).status, 403);
-  assert.equal((await fetch(f.origin + '/api/dsh', { headers: { cookie: a.cookie, 'x-tarot-request': '1' } })).status, 200);
+  assert.equal((await f.proxy(a, '/api/dsh')).status, 200);
   assert.equal(f.calls.length, 1);
+});
+
+test('managed page binds original fetch routes to its own session, without rewriting other fetches', async t => {
+  const f = await fixture(t); const a = await f.accept(await f.invite());
+  const html = await (await fetch(f.origin + '/ritual/' + a.id, { headers: { cookie: a.cookie } })).text();
+  const script = html.match(/<script id="companion-proxy-binding">(.*?)<\/script>/s)?.[1];
+  assert.ok(script, 'managed page must bind original absolute API routes to its session');
+  const calls = [];
+  const context = { window: { fetch: (...args) => { calls.push(args); return Promise.resolve('ok'); } }, location: { origin: f.origin }, URL, Headers };
+  vm.runInNewContext(script, context);
+  await context.window.fetch('/api/models', { method: 'POST', headers: { 'X-Tarot-Request': '1' }, body: 'original-body' });
+  assert.equal(new Headers(calls[0][1].headers).get('X-Companion-Session'), a.id);
+  assert.equal(calls[0][1].body, 'original-body');
+  await context.window.fetch('https://example.invalid/api/models', { headers: { test: 'original' } });
+  assert.equal(new Headers(calls[1][1].headers).get('X-Companion-Session'), null);
+});
+
+test('terminal cookies cannot restart original proxy work even alongside an active session cookie', async t => {
+  const f = await fixture(t); const active = await f.accept(await f.invite('active'));
+  for (const action of ['stop', 'delete', 'return']) {
+    const terminal = await f.revealed(await f.invite('terminal-' + action));
+    const body = action === 'return' ? { revision: (await f.session(terminal)).revision } : action === 'delete' ? { confirm: true } : {};
+    assert.equal((await f.post(terminal, action, body)).status, 200);
+    const jar = active.cookie + '; ' + terminal.cookie;
+    const starts = f.starts();
+    for (const [route, data] of [['/api/dsh', null], ['/api/dsh/import', { consent: true }], ['/api/models', { model: 'synthetic' }], ['/api/chat', { model: 'synthetic', messages: [{ content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }] }] }]]) {
+      assert.equal((await f.proxy(terminal, route, data, jar)).status, 403);
+    }
+    assert.equal(f.starts(), starts); assert.equal((await f.session(terminal)).phase, action === 'return' ? 'returned' : action === 'stop' ? 'stopped' : 'deleted');
+    if (action === 'stop') assert.equal((await f.post(terminal, 'return', { revision: (await f.session(terminal)).revision })).status, 200);
+  }
+  assert.equal((await f.proxy(active, '/api/dsh')).status, 200);
+});
+
+test('stop and delete cancel session-owned in-flight original photo requests and observers', async t => {
+  const f = await fixture(t);
+  for (const action of ['stop', 'delete']) {
+    const a = await f.accept(await f.invite()); f.mode('hold');
+    const response = await f.proxy(a, '/api/chat', { model: 'synthetic', messages: [{ content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } }] }] });
+    const cancelled = f.cancelled();
+    try {
+      await f.post(a, action, action === 'delete' ? { confirm: true } : {});
+      const outcome = await Promise.race([response.text().then(() => 'closed', () => 'closed'), new Promise(r => setTimeout(() => r('open'), 200))]);
+      assert.equal(outcome, 'closed');
+      for (let i = 0; i < 20 && f.cancelled() === cancelled; i++) await new Promise(r => setTimeout(r, 10));
+      assert.ok(f.cancelled() > cancelled);
+    } finally { f.release(); }
+  }
+});
+
+test('HTTP event pages are bounded and losslessly traverse sent, unknown and pending events', async t => {
+  const f = await fixture(t); const expected = [];
+  for (let i = 0; i < 7; i++) {
+    const a = await f.revealed(await f.invite('paged'));
+    const event = await (await f.post(a, 'return', { revision: (await f.session(a)).revision })).json(); expected.push(event.event_id);
+    const ref = { event_id: event.event_id, conversation_id: 'paged' };
+    if (i < 2) await f.admin('claim', ref);
+    if (i === 0) await f.admin('ack', { ...ref, message_id: 'real-message' });
+    if (i === 1) await f.admin('unknown', ref);
+  }
+  let cursor; const seen = []; const states = [];
+  do {
+    const response = await f.admin('events?conversation_id=paged&limit=3' + (cursor ? '&cursor=' + cursor : ''));
+    const text = await response.text(); assert.ok(Buffer.byteLength(text) < 65536);
+    const page = JSON.parse(text); assert.ok(page.events.length <= 3);
+    seen.push(...page.events.map(event => event.event_id)); states.push(...page.events.map(event => event.state));
+    cursor = page.next_cursor; if (!page.has_more) break;
+  } while (true);
+  assert.deepEqual(seen, expected); assert.deepEqual(states.slice(0, 3), ['sent', 'unknown', 'pending']);
+  assert.equal((await f.admin('events?conversation_id=paged&limit=101')).status, 400);
 });
 
 test('reading claims precede upstream, canonical builder wins, disconnect and replay never recharge', async t => {

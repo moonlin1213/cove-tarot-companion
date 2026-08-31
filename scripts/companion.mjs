@@ -47,8 +47,17 @@ async function call(config, route, body) {
   const response = await fetch(config.origin + BASE + route, { method: body === undefined ? 'GET' : 'POST', headers: {
     authorization: `Bearer ${config.adminToken}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }),
   }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(10000), redirect: 'error' });
-  if (!response.ok) throw new Error(`Local request rejected (${response.status}); check conversation, consent and state`);
-  return response.json();
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error(`Local request rejected (${response.status}); check conversation, consent and state`);
+  }
+  const chunks = []; let bytes = 0;
+  for await (const chunk of response.body) {
+    bytes += chunk.length;
+    if (bytes > 131072) throw new Error('Administrative response exceeds the 128 KiB limit');
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 export function parseArguments(args) {
   const options = {}; const positional = [];
@@ -65,7 +74,7 @@ export async function main(args = process.argv.slice(2)) {
 Usage: node scripts/companion.mjs COMMAND [--data-dir DIR]
   doctor | serve | stop-service
   invite --conversation ID [--manual] [--request ID]
-  events --conversation ID
+  events --conversation ID [--cursor CURSOR] [--limit 1..100]
   result --session ID --conversation ID
   claim | unknown --event ID --conversation ID
   ack --event ID --conversation ID --message ACTUAL_HOST_MESSAGE_ID
@@ -74,13 +83,17 @@ host message: persist a real host message before ack. Never auto-retry unknown.
 Credentials remain in the private data directory, never URLs or CLI output.`;
   const { options, positional } = parseArguments(args); const command = positional[0];
   if (!['doctor', 'serve', 'invite', 'events', 'result', 'claim', 'unknown', 'ack', 'stop-service'].includes(command) || positional.length !== 1) throw new Error('Use doctor, serve, invite, events, result, claim, unknown, ack or stop-service');
-  if (Object.keys(options).some(key => !['data-dir', 'conversation', 'manual', 'request', 'session', 'event', 'message'].includes(key))) throw new Error('Unknown option');
+  if (Object.keys(options).some(key => !['data-dir', 'conversation', 'manual', 'request', 'session', 'event', 'message', 'cursor', 'limit'].includes(key))) throw new Error('Unknown option');
   const config = await loadConfig(options['data-dir'] || defaultDataDir());
   if (command === 'serve') {
     process.umask(0o077);
     const engine = new Engine({ root: config.engineRoot, executable: config.executable, port: config.enginePort, token: config.engineToken });
     const service = await createService({ config, engine, store: async () => {
       // Called only after acquiring the fixed-port owner lock.
+      try {
+        await fs.lstat(path.join(config.dataDir, '.install.lock'));
+        throw new Error('Installation in progress; install lock prevents service startup');
+      } catch (error) { if (error.code !== 'ENOENT') throw error; }
       for (const suffix of ['', '-wal', '-shm']) {
         try {
           const stat = await fs.lstat(path.join(config.dataDir, 'state.sqlite' + suffix));
@@ -109,7 +122,12 @@ Credentials remain in the private data directory, never URLs or CLI output.`;
     const result = await call(config, '/invitations', { conversation_id: options.conversation, request_id: options.request || randomUUID(), manual: !!options.manual });
     return { invitation_id: result.id, conversation_id: result.conversation_id, url: `${config.origin}/invite/${result.id}`, state: result.state };
   }
-  if (command === 'events') return call(config, `/events?conversation_id=${encodeURIComponent(options.conversation)}`);
+  if (command === 'events') {
+    const query = new URLSearchParams({ conversation_id: options.conversation });
+    if (options.cursor !== undefined) query.set('cursor', options.cursor);
+    if (options.limit !== undefined) query.set('limit', options.limit);
+    return call(config, `/events?${query}`);
+  }
   if (command === 'result') return call(config, `/results/${encodeURIComponent(options.session || '')}?conversation_id=${encodeURIComponent(options.conversation)}`);
   const body = { event_id: options.event, conversation_id: options.conversation };
   if (command === 'ack') body.message_id = options.message;

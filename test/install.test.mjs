@@ -7,8 +7,18 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { install } from '../scripts/install.mjs';
 import { loadConfig } from '../src/config.mjs';
+import { Store } from '../src/store.mjs';
+import { DatabaseSync } from 'node:sqlite';
 
 const run = promisify(execFile);
+const cliScript = new URL('../scripts/companion.mjs', import.meta.url).pathname;
+async function waitForFile(filename) {
+  for (let i = 0; i < 500; i++) {
+    try { await fs.stat(filename); return; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    await new Promise(r => setTimeout(r, 10));
+  }
+  throw new Error('fixture did not reach its real filesystem switch');
+}
 async function fixture(t) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'companion-install-')));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -113,4 +123,50 @@ test('npm generated executable symlinks are owned and verified without allowing 
   assert.equal(result.state, 'installed');
   assert.ok((await fs.lstat(path.join(options.skillDir, 'engine/node_modules/.bin/fixture-tool'))).isSymbolicLink());
   assert.equal((await install(options)).state, 'unchanged');
+});
+
+test('real update and uninstall exclude a CLI start after the stopped probe and before filesystem switch', async t => {
+  for (const operation of ['update', 'uninstall']) await t.test(operation, async t => {
+    const options = await fixture(t); await install(options);
+    const databasePath = path.join(options.dataDir, 'state.sqlite');
+    const store = new Store(databasePath);
+    const invitation = store.invite({ conversation_id: 'chat', request_id: 'seed', manual: true });
+    store.accept(invitation.id);
+    store.draw(invitation.id, { event_id: 'draw', question: '', spread_id: 'one', draws: [{ position: 0, card_id: 'fool', reversed: false }] });
+    store.reveal(invitation.id, { event_id: 'reveal', positions: [0] });
+    store.claimReading(invitation.id, { action_id: 'charge', model: 'synthetic' });
+    store.close(); await fs.chmod(databasePath, 0o600);
+    const marker = path.join(options.root, 'switch-paused'); const release = path.join(options.root, 'switch-release');
+    const hook = path.join(options.root, 'pause-switch.mjs');
+    await fs.writeFile(hook, `import fs from 'node:fs/promises';
+      const rename=fs.rename;
+      fs.rename=async(from,to)=>{
+        if(from===${JSON.stringify(options.skillDir)}){
+          await fs.writeFile(${JSON.stringify(marker)},'paused');
+          for(let i=0;i<1000;i++){try{await fs.stat(${JSON.stringify(release)});break;}catch{await new Promise(r=>setTimeout(r,10));}}
+        }
+        return rename(from,to);
+      };`);
+    const installing = run(process.execPath, ['--import', hook, path.join(options.packageRoot, 'scripts/install.mjs'), '--data-dir', options.dataDir, '--skill-dir', options.skillDir, '--' + operation], { env: options.environment, timeout: 15000 }).then(result => ({ result }), error => ({ error }));
+    let finished;
+    try {
+      await waitForFile(marker);
+      await assert.rejects(run(process.execPath, [cliScript, 'serve', '--data-dir', options.dataDir], { env: options.environment, timeout: 700 }), /install.*lock|installation.*progress/i);
+      const readOnly = new DatabaseSync(databasePath, { readOnly: true });
+      try { assert.equal(readOnly.prepare('SELECT state FROM readings').get().state, 'running'); } finally { readOnly.close(); }
+    } finally { await fs.writeFile(release, 'continue'); finished = await installing; }
+    if (finished.error) throw finished.error;
+    assert.equal(JSON.parse(finished.result.stdout).state, operation === 'update' ? 'updated' : 'uninstalled');
+  });
+});
+
+test('a live authenticated CLI owner blocks both update and uninstall without replacing its code', async t => {
+  const options = await fixture(t); await install(options);
+  const cli = (...args) => run(process.execPath, [cliScript, ...args, '--data-dir', options.dataDir], { env: options.environment, timeout: 10000 });
+  await cli('invite', '--conversation', 'chat', '--manual');
+  try {
+    const before = await fs.readFile(path.join(options.skillDir, 'engine/server.mjs'), 'utf8');
+    for (const operation of ['update', 'uninstall']) await assert.rejects(install({ ...options, [operation]: true }), /Stop the owned service/);
+    assert.equal(await fs.readFile(path.join(options.skillDir, 'engine/server.mjs'), 'utf8'), before);
+  } finally { await cli('stop-service'); }
 });

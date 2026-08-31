@@ -29,6 +29,7 @@ async function readBody(req, limit = 65536) {
 export async function createService({ config, store: storeOrFactory, engine }) {
   let store; let ready = false; let closing = false; let closePromise;
   const workers = new Map(); const bindings = new Map(); const streams = new Set();
+  const proxies = new Set();
   const server = http.createServer((req, res) => {
     handle(req, res).catch(error => {
       if (res.destroyed) return;
@@ -65,6 +66,16 @@ export async function createService({ config, store: storeOrFactory, engine }) {
     }
     throw fail(403);
   }
+  function activeProxyBinding(req) {
+    const id = req.headers['x-companion-session'];
+    if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) throw fail(403);
+    const value = binding(req, id);
+    if (!['accepted', 'drawn', 'revealed'].includes(store.session(id).phase)) throw fail(403);
+    return value;
+  }
+  function cancelSession(id) {
+    for (const operation of [...workers.values(), ...proxies]) if (operation.sessionId === id) operation.controller.abort();
+  }
   function csrf(req, value) {
     if (req.headers.origin !== origin || !equal(req.headers['x-companion-csrf'], value.csrf)) throw fail(403);
   }
@@ -85,7 +96,10 @@ export async function createService({ config, store: storeOrFactory, engine }) {
       const command = pathname.slice(`${BASE}/`.length);
       if (req.method === 'GET') {
         if (command === 'health') return json(res, { protocol: 'cove-tarot-companion-v1', installation_id: config.installationId, pid: process.pid });
-        if (command === 'events') return json(res, store.events(url.searchParams.get('conversation_id')));
+        if (command === 'events') return json(res, store.eventsPage(url.searchParams.get('conversation_id'), {
+          cursor: url.searchParams.get('cursor') ?? undefined,
+          limit: url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50,
+        }));
         if (command.startsWith('results/')) {
           const session = store.session(command.slice('results/'.length));
           if (session.conversation_id !== url.searchParams.get('conversation_id')) throw fail(404);
@@ -131,11 +145,11 @@ export async function createService({ config, store: storeOrFactory, engine }) {
       csrf(req, value); const body = await readBody(req);
       if (action === 'draw') { canonicalDraw(body, await engine.catalog()); return json(res, store.draw(id, body)); }
       if (action === 'reveal') return json(res, store.reveal(id, body));
-      if (action === 'return') return json(res, store.returnSession(id, body.revision));
+      if (action === 'return') { const event = store.returnSession(id, body.revision); cancelSession(id); return json(res, event); }
       if (action === 'stop' || action === 'delete') {
         if (action === 'delete' && body.confirm !== true) throw fail(400);
         const session = store[action](id);
-        for (const worker of workers.values()) if (worker.sessionId === id) worker.controller.abort();
+        cancelSession(id);
         return json(res, session);
       }
       if (action === 'reading') {
@@ -158,33 +172,43 @@ export async function createService({ config, store: storeOrFactory, engine }) {
       throw fail(404);
     }
     if (pathname.startsWith('/api/')) {
-      anyBinding(req);
+      const value = activeProxyBinding(req);
       if (req.headers['x-tarot-request'] !== '1') throw fail(403);
       const get = pathname === '/api/dsh';
       if (!['/api/dsh', '/api/dsh/import', '/api/models', '/api/chat'].includes(pathname) || req.method !== (get ? 'GET' : 'POST')) throw fail(404);
       if (!get && req.headers.origin !== origin) throw fail(403);
-      let body = get ? null : await readBody(req, 4 * 1024 * 1024);
-      if (pathname === '/api/chat') {
-        // This original route is needed only for the original photo identifier.
-        // Managed paid reading always goes through the durable action claim.
-        const parts = body.messages?.flatMap(message => Array.isArray(message.content) ? message.content : []);
-        const dataUrl = parts?.find(part => part.type === 'image_url')?.image_url?.url;
-        if (typeof dataUrl !== 'string' || !/^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) throw fail(400);
-        body = { ...body, messages: (await engine.catalog()).buildIdentifyMessages(dataUrl) };
+      const operation = { sessionId: value.id, controller: new AbortController() };
+      const abort = () => operation.controller.abort();
+      operation.controller.signal.addEventListener('abort', () => res.destroy(), { once: true });
+      res.once('close', abort); proxies.add(operation);
+      try {
+        let body = get ? null : await readBody(req, 4 * 1024 * 1024);
+        if (pathname === '/api/chat') {
+          // Only the original photo identifier may bypass the durable read claim.
+          const parts = body.messages?.flatMap(message => Array.isArray(message.content) ? message.content : []);
+          const dataUrl = parts?.find(part => part.type === 'image_url')?.image_url?.url;
+          if (typeof dataUrl !== 'string' || !/^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) throw fail(400);
+          body = { ...body, messages: (await engine.catalog()).buildIdentifyMessages(dataUrl) };
+        }
+        // Consent may have been revoked while uploading or loading the catalog.
+        operation.controller.signal.throwIfAborted(); activeProxyBinding(req);
+        const response = await engine.request(pathname, { method: req.method, headers: { 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.any([operation.controller.signal, AbortSignal.timeout(125000)]) });
+        if (!response.ok) { await response.body?.cancel(); throw fail(response.status); }
+        res.writeHead(response.status, { 'content-type': response.headers.get('content-type') || 'application/json' });
+        let size = 0;
+        for await (const chunk of response.body) { size += chunk.length; if (size > 4 * 1024 * 1024 || res.destroyed || res.writableLength > 262144) break; res.write(chunk); }
+        return res.end();
+      } finally {
+        res.off('close', abort); proxies.delete(operation);
       }
-      const response = await engine.request(pathname, { method: req.method, headers: { 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(125000) });
-      if (!response.ok) { await response.body?.cancel(); throw fail(response.status); }
-      res.writeHead(response.status, { 'content-type': response.headers.get('content-type') || 'application/json' });
-      let size = 0;
-      for await (const chunk of response.body) { size += chunk.length; if (size > 4 * 1024 * 1024 || res.destroyed || res.writableLength > 262144) break; res.write(chunk); }
-      return res.end();
     }
     match = /^\/ritual\/([A-Za-z0-9_-]{1,128})$/.exec(pathname);
     if (match && req.method === 'GET') {
       binding(req, match[1]); store.session(match[1]);
       const html = await staticFile('index.html');
       res.setHeader('content-type', 'text/html; charset=utf-8');
-      return res.end(html.toString('utf8').replace('<head>', `<head><base href="/"><script type="application/json" id="companion-config">${scriptJSON({ protocol: 'cove-tarot-companion-v1', sessionId: match[1], apiBase: BASE })}</script>`));
+      const proxyBinding = `(()=>{const sessionId=${scriptJSON(match[1])};const nativeFetch=window.fetch.bind(window);window.fetch=(input,init)=>{const url=new URL(typeof input==='string'?input:input.url||String(input),location.origin);if(url.origin===location.origin&&['/api/dsh','/api/dsh/import','/api/models','/api/chat'].includes(url.pathname)){const headers=new Headers(init?.headers||input?.headers);headers.set('X-Companion-Session',sessionId);return nativeFetch(input,{...init,headers});}return nativeFetch(input,init);};})();`;
+      return res.end(html.toString('utf8').replace('<head>', `<head><base href="/"><script type="application/json" id="companion-config">${scriptJSON({ protocol: 'cove-tarot-companion-v1', sessionId: match[1], apiBase: BASE })}</script><script id="companion-proxy-binding">${proxyBinding}</script>`));
     }
     anyBinding(req);
     if (req.method !== 'GET' || !/^\/(?:js|css|data|fonts|vendor|assets)\/[A-Za-z0-9_./-]+$/.test(pathname)) throw fail(404);
@@ -257,6 +281,7 @@ export async function createService({ config, store: storeOrFactory, engine }) {
     closePromise ??= (async () => {
       closing = true;
       for (const worker of workers.values()) worker.controller.abort();
+      for (const operation of proxies) operation.controller.abort();
       for (const res of streams) res.end();
       await Promise.all([...workers.values()].map(worker => worker.promise));
       await engine.close();

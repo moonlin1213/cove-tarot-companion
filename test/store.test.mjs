@@ -35,6 +35,35 @@ test('package runtime contract requires Node 24.5 or later', () => {
   assert.equal(packageJson.engines.node, '>=24.5.0');
 });
 
+test('bounded event pages traverse all states with non-recycling cursors after deletion and reopen', t => {
+  const f = fixture(t); const expected = []; const sessionIds = [];
+  const add = key => {
+    const invitation = f.store.invite({ conversation_id: 'paged', request_id: key, manual: true });
+    f.store.accept(invitation.id); f.store.stop(invitation.id);
+    const event = f.store.returnSession(invitation.id, f.store.session(invitation.id).revision);
+    sessionIds.push(invitation.id); expected.push(event.event_id); return event;
+  };
+  for (let i = 0; i < 8; i++) {
+    const event = add('page-' + i); const ref = { event_id: event.event_id, conversation_id: 'paged' };
+    if (i === 0) { f.store.claimDelivery(ref); f.store.ack({ ...ref, message_id: 'real-message' }); }
+    if (i === 1) { f.store.claimDelivery(ref); f.store.markDeliveryUnknown(ref); }
+  }
+  let cursor; const seen = []; const states = [];
+  do {
+    const page = f.store.eventsPage('paged', { cursor, limit: 3 });
+    assert.ok(page.events.length <= 3); assert.equal(typeof page.has_more, 'boolean');
+    seen.push(...page.events.map(event => event.event_id)); states.push(...page.events.map(event => event.state));
+    cursor = page.next_cursor; if (!page.has_more) break;
+  } while (true);
+  assert.deepEqual(seen, expected); assert.deepEqual(states.slice(0, 3), ['sent', 'unknown', 'pending']);
+  for (const sessionId of sessionIds) f.store.delete(sessionId);
+  f.reopen(); const fresh = add('after-all-deleted');
+  const next = f.store.eventsPage('paged', { cursor, limit: 3 });
+  assert.deepEqual(next.events.map(event => event.event_id), [fresh.event_id]);
+  for (const options of [{ limit: 0 }, { limit: 101 }, { limit: 1.1 }, { cursor: 'bad' }]) assert.throws(() => f.store.eventsPage('paged', options), /limit|cursor/);
+  assert.throws(() => f.store.eventsPage('other', { cursor }), /cursor/);
+});
+
 test('reading claims preserve original nonempty model values through the 256-character boundary', t => {
   const { store } = fixture(t);
   const models = ['vendor/token-model', 'password-model', 'api-key-model', '  selected-model  ', 'x'.repeat(256)];
