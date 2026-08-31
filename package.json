@@ -1,0 +1,9 @@
+{
+  "name": "cove-tarot-companion",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local consent-first companion connector for the original Tarot ritual engine",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": { "test": "node --test test/*.test.mjs" }
+}
