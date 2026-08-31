@@ -69,6 +69,8 @@ The next operational command starts the owned service as needed; there is no def
 `npm test` runs unit/integration tests. Actual-browser tests are opt-in and **must** be enabled for a release gate; skipped browser tests are not compatibility evidence. CI installs the exact engine through the package installer and runs Chromium/WebKit against an isolated fake loopback provider, including original manual provider setup, draw/batch reveal, saved refresh, return and a persisted synthetic host-message receipt. Paid providers, personal DSH profiles, arbitrary host brands, mobile browsers and Windows are not covered by those tests.
 
 ```sh
+# Run validation in the source checkout (installed skills omit test/ and .git):
+cd /chosen/reviewed-release/cove-tarot-companion
 npm ci
 npm install --no-save --package-lock=false playwright@1.62.1
 npx playwright install chromium webkit

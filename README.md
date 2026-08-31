@@ -69,6 +69,8 @@ node scripts/install.mjs --skill-dir "$HOME/.agents/skills/cove-tarot-companion"
 `npm test` 运行回归测试。真实浏览器验收必须显式开启；跳过不能算通过。CI 通过本包安装器取得固定引擎，使用 Chromium/WebKit 原 UI 与本机假上游，覆盖原设置手动配置、抽牌/整组翻牌、刷新、返回及假宿主真实持久化消息后 ACK。没有实测付费供应商、个人 DSH 账号、任意宿主品牌、手机浏览器或 Windows，不能据此声称通用兼容。
 
 ```sh
+# 验证须在源码 checkout 运行（已安装技能不包含 test/ 和 .git）：
+cd /chosen/reviewed-release/cove-tarot-companion
 npm ci
 npm install --no-save --package-lock=false playwright@1.62.1
 npx playwright install chromium webkit

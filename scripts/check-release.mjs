@@ -41,19 +41,31 @@ export async function checkRelease({ cwd = process.cwd(), privateTerms = [], exp
     if (mode === '120000') add('symlink', location);
     scan(name, location);
   };
+  const checkLock = (text, location, expected) => {
+    try {
+      const lock = JSON.parse(text);
+      if (lock.repository !== SOURCE || !/^[a-f0-9]{40}$/.test(lock.commit) || (expected && lock.commit !== expected)) throw new Error();
+      return { repository: lock.repository, commit: lock.commit };
+    } catch { add('engine-lock', location); return null; }
+  };
   const blob = (sha, location) => {
     blobIds.add(sha);
-    scan(git('cat-file', 'blob', sha), location);
+    const text = git('cat-file', 'blob', sha);
+    scan(text, location);
+    return text;
   };
   // Do not print a path supplied by private content or a caller's private terms.
   // Ordinal locations can be resolved privately with git ls-files/ls-tree.
   const tracked = git('ls-files', '-s', '-z').split('\0').filter(Boolean);
+  let indexLock = null;
   for (let i = 0; i < tracked.length; i++) {
     const record = /^(\d+) ([a-f0-9]+) (\d)\t([\s\S]+)$/.exec(tracked[i]);
     if (!record) throw new Error('Cannot parse tracked index');
     const [, mode, sha, stage, name] = record;
     const location = `index:${i + 1}`;
-    checkPath(name, location, mode); blob(sha, location);
+    checkPath(name, location, mode);
+    const text = blob(sha, location);
+    if (name === 'engine-lock.json' && stage === '0' && ['100644', '100755'].includes(mode)) indexLock = checkLock(text, location, expectedCommit);
     if (stage !== '0') add('unmerged-index', location);
     try {
       const stat = await fs.lstat(path.join(cwd, name));
@@ -62,6 +74,11 @@ export async function checkRelease({ cwd = process.cwd(), privateTerms = [], exp
       else add('nonregular-file', `working:${i + 1}`);
     } catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
+  if (!indexLock) add('engine-lock', 'index:engine-lock');
+  // HEAD is still the publishable commit when an explicit base excludes it.
+  // Older exact pins are allowed; expectedCommit describes the staged release.
+  try { checkLock(git('show', 'HEAD:engine-lock.json'), 'HEAD:engine-lock'); }
+  catch { add('engine-lock', 'HEAD:engine-lock'); }
   if (base && !/^[a-f0-9]{40}$/.test(base)) throw new Error('Base must be an exact commit');
   const commits = git('rev-list', base ? `${base}..HEAD` : 'HEAD').trim().split('\n').filter(Boolean);
   for (const commit of commits) {
@@ -74,12 +91,18 @@ export async function checkRelease({ cwd = process.cwd(), privateTerms = [], exp
       if (!match) throw new Error('Cannot parse commit tree');
       const [, mode, type, sha, name] = match; const location = `history:${commit}:${i + 1}`;
       checkPath(name, location, mode);
-      if (type !== 'blob') add('non-blob-entry', location); else blob(sha, location);
+      if (type !== 'blob') add('non-blob-entry', location);
+      else {
+        const text = blob(sha, location);
+        if (name === 'engine-lock.json') checkLock(text, location);
+      }
     }
   }
   try {
-    const lock = JSON.parse(await fs.readFile(path.join(cwd, 'engine-lock.json'), 'utf8'));
-    if (lock.repository !== SOURCE || !/^[a-f0-9]{40}$/.test(lock.commit) || (expectedCommit && lock.commit !== expectedCommit)) add('engine-lock', 'engine-lock');
+    const filename = path.join(cwd, 'engine-lock.json');
+    if (!(await fs.lstat(filename)).isFile()) throw new Error();
+    const lock = checkLock(await fs.readFile(filename, 'utf8'), 'engine-lock', expectedCommit);
+    if (JSON.stringify(lock) !== JSON.stringify(indexLock)) add('engine-lock', 'working-index:engine-lock');
   } catch { add('engine-lock', 'engine-lock'); }
   return { ok: !findings.length, commits: commits.length, blobs: blobIds.size, tracked: tracked.length, findings };
 }

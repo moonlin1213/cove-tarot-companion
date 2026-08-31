@@ -88,3 +88,44 @@ test('credential assignments without a vendor prefix are detected while explicit
   await f.write('settings.js', 'export const apiKey = "synthetic-example-key";'); f.git('add', '.');
   assert.equal((await scan({ cwd: f.root })).ok, true);
 });
+
+test('a valid unstaged lock cannot mask an invalid staged release lock', async t => {
+  const f = await fixture(t);
+  const valid = await fs.readFile(path.join(f.root, 'engine-lock.json'), 'utf8');
+  await f.write('engine-lock.json', JSON.stringify({ repository: 'https://example.invalid/unreviewed.git', commit: 'main' }));
+  f.git('add', 'engine-lock.json');
+  await f.write('engine-lock.json', valid);
+  const result = await scan({ cwd: f.root, expectedCommit: 'a'.repeat(40) });
+  assert.equal(result.ok, false);
+  assert.ok(result.findings.some(f => f.rule === 'engine-lock' && f.location.startsWith('index:')));
+});
+
+test('a valid working and staged lock cannot mask an invalid HEAD lock, even with an empty history range', async t => {
+  const f = await fixture(t);
+  const valid = await fs.readFile(path.join(f.root, 'engine-lock.json'), 'utf8');
+  await f.write('engine-lock.json', JSON.stringify({ repository: 'https://example.invalid/unreviewed.git', commit: 'main' })); f.commit();
+  await f.write('engine-lock.json', valid); f.git('add', 'engine-lock.json');
+  for (const base of [undefined, f.git('rev-parse', 'HEAD')]) {
+    const result = await scan({ cwd: f.root, base, expectedCommit: 'a'.repeat(40) });
+    assert.equal(result.ok, false);
+    assert.ok(result.findings.some(f => f.rule === 'engine-lock' && (f.location.startsWith('history:') || f.location === 'HEAD:engine-lock')));
+  }
+});
+
+test('expected pin applies to the staged release while legitimate historical versions remain valid', async t => {
+  const f = await fixture(t);
+  const valid = JSON.parse(await fs.readFile(path.join(f.root, 'engine-lock.json'), 'utf8'));
+  await f.write('engine-lock.json', JSON.stringify({ ...valid, commit: 'b'.repeat(40) }));
+  f.git('add', 'engine-lock.json');
+  assert.equal((await scan({ cwd: f.root, expectedCommit: 'b'.repeat(40) })).ok, true, 'staging a new reviewed exact pin must not require rewriting HEAD');
+  f.commit();
+  assert.equal((await scan({ cwd: f.root, expectedCommit: 'b'.repeat(40) })).ok, true, 'older immutable pins must not equal the newest expected pin');
+  await f.write('engine-lock.json', JSON.stringify(valid));
+  assert.equal((await scan({ cwd: f.root })).ok, false, 'different valid working/index pins must not mask each other without an expected pin');
+});
+
+test('the engine lock must exist in the release index, not just as an untracked working file', async t => {
+  const f = await fixture(t);
+  f.git('rm', '--cached', 'engine-lock.json');
+  assert.equal((await scan({ cwd: f.root })).ok, false);
+});
