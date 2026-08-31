@@ -11,6 +11,8 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 export class Engine {
   #child = null;
   #starting = null;
+  #closing = null;
+  #generation = 0;
   #catalog;
   constructor({ root, executable = process.execPath, port, token, environment = process.env }) {
     if (!path.isAbsolute(root) || !path.isAbsolute(executable) || !Number.isInteger(port) || port < 1024 || port > 65535 || !token) throw new Error('Invalid fixed engine configuration');
@@ -45,36 +47,67 @@ export class Engine {
       socket.setTimeout(1000, () => { socket.destroy(); resolve(true); });
     });
   }
-  async start() {
-    if (this.#starting) return this.#starting;
-    this.#starting = this.#start();
-    try { await this.#starting; } finally { this.#starting = null; }
+  async start(signal) {
+    signal?.throwIfAborted();
+    if (this.#closing) throw new Error('Engine is closing');
+    if (!this.#starting) {
+      const startup = { generation: this.#generation, signals: [signal] };
+      this.#starting = startup;
+      startup.promise = this.#start(startup).finally(() => { if (this.#starting === startup) this.#starting = null; });
+    } else this.#starting.signals.push(signal);
+    await this.#starting.promise;
+    signal?.throwIfAborted();
   }
-  async #start() {
-    if (await this.#identity()) return;
-    if (await this.#occupied()) throw new Error('Engine port occupied by an unauthenticated service');
+  async #start(startup) {
+    const check = () => {
+      if (startup.generation !== this.#generation) throw new Error('Engine startup cancelled by close');
+      // Coalesced callers retain independent cancellation: an active caller
+      // still needs startup, but cancelled callers alone cannot launch a child.
+      if (startup.signals.every(signal => signal?.aborted)) throw new DOMException('Engine startup aborted', 'AbortError');
+    };
+    const identified = await this.#identity(); check();
+    if (identified) return;
+    const occupied = await this.#occupied(); check();
+    if (occupied) throw new Error('Engine port occupied by an unauthenticated service');
     const child = spawn(this.executable, ['--use-env-proxy', 'server.mjs'], { cwd: this.root, env: this.environment, stdio: 'ignore' });
     this.#child = child;
     let failed = false;
     child.once('error', () => { failed = true; });
     child.once('exit', () => { failed = true; if (this.#child === child) this.#child = null; });
-    for (let i = 0; i < 100 && !failed; i++) {
-      if (await this.#identity()) return;
-      await delay(50);
+    try {
+      for (let i = 0; i < 100 && !failed; i++) {
+        const identified = await this.#identity(); check();
+        if (identified) return;
+        await delay(50); check();
+      }
+      throw new Error('Owned engine failed to start or authenticate');
+    } catch (error) {
+      // Startup cleanup must not call close(), which waits for this startup.
+      await this.#stopChild(child);
+      throw error;
     }
-    await this.close();
-    throw new Error('Owned engine failed to start or authenticate');
   }
   async request(route, options = {}) {
     if (!ROUTES.has(route)) throw new Error('Engine route is not allowed');
-    await this.start();
+    await this.start(options.signal);
     return fetch(this.origin + route, { ...options, redirect: 'error', headers: {
       ...options.headers, host: `127.0.0.1:${this.port}`, origin: this.origin, 'x-tarot-request': '1',
     } });
   }
-  async close() {
-    const child = this.#child;
-    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  close() {
+    if (this.#closing) return this.#closing;
+    this.#generation++;
+    this.#closing = (async () => {
+      await this.#starting?.promise.catch(() => {});
+      await this.#stopChild(this.#child);
+    })().finally(() => { this.#closing = null; });
+    return this.#closing;
+  }
+  async #stopChild(child) {
+    if (!child?.pid || child.exitCode !== null || child.signalCode !== null) {
+      if (this.#child === child) this.#child = null;
+      return;
+    }
     await new Promise(resolve => {
       const timer = setTimeout(() => child.kill('SIGKILL'), 1500);
       child.once('exit', () => { clearTimeout(timer); resolve(); });

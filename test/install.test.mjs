@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { install } from '../scripts/install.mjs';
-import { loadConfig } from '../src/config.mjs';
+import { loadConfig, writeConfig } from '../src/config.mjs';
+import { Engine } from '../src/engine.mjs';
 import { Store } from '../src/store.mjs';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -169,4 +171,57 @@ test('a live authenticated CLI owner blocks both update and uninstall without re
     for (const operation of ['update', 'uninstall']) await assert.rejects(install({ ...options, [operation]: true }), /Stop the owned service/);
     assert.equal(await fs.readFile(path.join(options.skillDir, 'engine/server.mjs'), 'utf8'), before);
   } finally { await cli('stop-service'); }
+});
+
+test('changed engine pin refuses a compatible authenticated orphan before switching code or config', async t => {
+  const options = await fixture(t); const source = path.join(options.root, 'source');
+  async function version(build) {
+    await fs.writeFile(path.join(source, 'server.mjs'), `import http from 'node:http';
+      http.createServer((req,res)=>{
+        if(req.headers.authorization!=='Bearer '+process.env.COVE_TAROT_COMPANION_TOKEN){res.writeHead(403).end();return;}
+        res.end(JSON.stringify({protocol:'cove-tarot-engine-v1',engine:'tarot',version:1,build:${JSON.stringify(build)}}));
+      }).listen(Number(process.env.PORT),'127.0.0.1');`);
+    await run('git', ['-C', source, 'add', 'server.mjs'], { env: options.environment });
+    await run('git', ['-C', source, 'commit', '-m', 'synthetic-' + build], { env: options.environment });
+    const commit = (await run('git', ['-C', source, 'rev-parse', 'HEAD'], { env: options.environment })).stdout.trim();
+    await fs.writeFile(path.join(options.packageRoot, 'engine-lock.json'), JSON.stringify({ repository: 'https://github.com/moonlin1213/tarot-ritual.git', commit }));
+    return commit;
+  }
+  const commitA = await version('A'); await install(options);
+  const reservation = http.createServer(); await new Promise(r => reservation.listen(0, '127.0.0.1', r));
+  const enginePort = reservation.address().port; await new Promise(r => reservation.close(r));
+  const config = await writeConfig(options.dataDir, { enginePort });
+  const owner = new Engine({ root: config.engineRoot, port: enginePort, token: config.engineToken, environment: { HOME: options.root } });
+  t.after(() => owner.close());
+  await owner.start(); const pid = owner.pid;
+  assert.equal((await install(options)).state, 'unchanged', 'no-op installation remains harmless while A runs');
+  const code = await fs.readFile(path.join(config.engineRoot, 'server.mjs'), 'utf8');
+  const configText = await fs.readFile(path.join(options.dataDir, 'config.json'), 'utf8');
+  await fs.writeFile(path.join(options.dataDir, 'saved-record'), 'retain A data');
+  const commitB = await version('B'); assert.notEqual(commitB, commitA);
+  for (const operation of ['update', 'uninstall']) {
+    await assert.rejects(install({ ...options, [operation]: true }), /engine port.*occupied/i);
+    assert.equal(await fs.readFile(path.join(config.engineRoot, 'server.mjs'), 'utf8'), code);
+    assert.equal(await fs.readFile(path.join(options.dataDir, 'config.json'), 'utf8'), configText);
+    assert.equal(await fs.readFile(path.join(options.dataDir, 'saved-record'), 'utf8'), 'retain A data');
+    assert.doesNotThrow(() => process.kill(pid, 0));
+    assert.equal((await (await owner.request('/api/companion-health', { headers: { authorization: 'Bearer ' + config.engineToken } })).json()).build, 'A');
+  }
+  await owner.close();
+  assert.equal((await install({ ...options, update: true })).commit, commitB);
+  assert.equal(await fs.readFile(path.join(options.dataDir, 'config.json'), 'utf8'), configText);
+  await owner.start();
+  assert.equal((await (await owner.request('/api/companion-health', { headers: { authorization: 'Bearer ' + config.engineToken } })).json()).build, 'B');
+});
+
+test('foreign engine-port occupants block update and uninstall without being terminated', async t => {
+  const options = await fixture(t); await install(options);
+  const foreign = http.createServer((req, res) => res.end('foreign service'));
+  await new Promise(r => foreign.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise(r => foreign.close(r)));
+  const port = foreign.address().port;
+  await writeConfig(options.dataDir, { enginePort: port });
+  for (const operation of ['update', 'uninstall']) await assert.rejects(install({ ...options, [operation]: true }), /engine port.*occupied/i);
+  assert.equal(await (await fetch(`http://127.0.0.1:${port}`)).text(), 'foreign service');
+  assert.equal((await install(options)).state, 'unchanged');
 });

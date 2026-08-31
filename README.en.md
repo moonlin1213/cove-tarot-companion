@@ -64,6 +64,8 @@ Run updates from a newly downloaded, reviewed release, after stopping this insta
 
 The next operational command starts the owned service as needed; there is no default startup agent. Normal stop closes the owned engine child. A hard-killed connector can leave an authenticated orphan engine, which a replacement can reuse but cannot stop through a child handle it never owned. No kill-by-port or unrelated-process cleanup is performed.
 
+Normal stop cancels and drains in-flight engine startup and proxy work. Update/uninstall requires a free engine port: even an authenticated orphan is refused before code switches, preventing new files from mixing with an old process. Stop it through its known original owner or terminal. If a crash left no trusted owner handle, save your work and restart the computer, then retry installation before starting the companion again. Never guess a process to terminate from its port. A harmless unchanged repeat installation remains available.
+
 ## Validation and scope
 
 `npm test` runs unit/integration tests. Actual-browser tests are opt-in and **must** be enabled for a release gate; skipped browser tests are not compatibility evidence. CI installs the exact engine through the package installer and runs Chromium/WebKit against an isolated fake loopback provider, including original manual provider setup, draw/batch reveal, saved refresh, return and a persisted synthetic host-message receipt. Paid providers, personal DSH profiles, arbitrary host brands, mobile browsers and Windows are not covered by those tests.

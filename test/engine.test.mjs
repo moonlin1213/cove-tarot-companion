@@ -80,6 +80,82 @@ test('an authenticated orphan can be reused, but another owner never kills it by
   assert.equal((await next.request('/api/companion-health', { headers: { authorization: 'Bearer synthetic-engine-secret' } })).status, 200);
 });
 
+test('close drains held initial startup, rejects concurrent starts, and permits a later cold restart', async t => {
+  const { engine } = await fixture(t);
+  const originalFetch = globalThis.fetch;
+  const entered = Promise.withResolvers(); const release = Promise.withResolvers();
+  let held = true; let closed = false;
+  globalThis.fetch = async (...args) => {
+    if (held && args[0] === engine.origin + '/api/companion-health') {
+      held = false; entered.resolve(); await release.promise;
+    }
+    return originalFetch(...args);
+  };
+  const starting = engine.start().then(() => 'started', () => 'cancelled');
+  let closing; let concurrent;
+  try {
+    await entered.promise;
+    closing = engine.close().then(() => { closed = true; });
+    concurrent = engine.start().then(() => 'started', () => 'cancelled');
+    await new Promise(r => setTimeout(r, 25));
+    assert.equal(closed, false, 'close must settle the startup before releasing ownership');
+    release.resolve(); await Promise.all([starting, concurrent, closing]);
+    assert.equal(await starting, 'cancelled'); assert.equal(await concurrent, 'cancelled');
+    assert.equal(engine.pid, null);
+    await assert.rejects(originalFetch(engine.origin), /fetch failed/);
+  } finally {
+    release.resolve();
+    await Promise.all([starting, concurrent, closing]);
+    globalThis.fetch = originalFetch;
+    // Also clean up the late child when this regression runs against old code.
+    if (engine.pid) await engine.close();
+  }
+  await engine.start(); assert.ok(engine.pid > 0);
+});
+
+test('cancelled engine requests cannot launch a child before the initial probe', async t => {
+  const { engine } = await fixture(t);
+  await assert.rejects(engine.request('/api/dsh', { signal: AbortSignal.abort() }), /abort/i);
+  assert.equal(engine.pid, null);
+});
+
+test('cancelled engine requests cannot launch a child during the initial probe', async t => {
+  const { engine } = await fixture(t);
+  const originalFetch = globalThis.fetch;
+  const entered = Promise.withResolvers(); const release = Promise.withResolvers();
+  const controller = new AbortController();
+  globalThis.fetch = async (...args) => {
+    if (args[0] === engine.origin + '/api/companion-health') { entered.resolve(); await release.promise; }
+    return originalFetch(...args);
+  };
+  const requesting = engine.request('/api/dsh', { signal: controller.signal }).then(() => 'success', () => 'cancelled');
+  try { await entered.promise; controller.abort(); }
+  finally { release.resolve(); await requesting; globalThis.fetch = originalFetch; }
+  assert.equal(await requesting, 'cancelled'); assert.equal(engine.pid, null);
+  await assert.rejects(fetch(engine.origin), /fetch failed/);
+});
+
+test('one cancelled caller does not cancel a concurrent active engine request', async t => {
+  const { engine } = await fixture(t);
+  const originalFetch = globalThis.fetch;
+  const entered = Promise.withResolvers(); const release = Promise.withResolvers();
+  const controller = new AbortController();
+  let held = true;
+  globalThis.fetch = async (...args) => {
+    if (held && args[0] === engine.origin + '/api/companion-health') { held = false; entered.resolve(); await release.promise; }
+    return originalFetch(...args);
+  };
+  const first = engine.request('/api/dsh', { signal: controller.signal }).then(() => 'success', () => 'cancelled');
+  let active;
+  try {
+    await entered.promise;
+    active = engine.request('/api/companion-health', { headers: { authorization: 'Bearer synthetic-engine-secret' } });
+    controller.abort(); release.resolve();
+    assert.equal(await first, 'cancelled'); assert.equal((await active).status, 200);
+    assert.ok(engine.pid > 0);
+  } finally { release.resolve(); await Promise.allSettled([first, active]); globalThis.fetch = originalFetch; }
+});
+
 test('config enforces runtime floor, private regular secrets and stable installation values', async t => {
   const { root } = await fixture(t);
   assert.throws(() => assertRuntime('24.4.9'), /24.5/);

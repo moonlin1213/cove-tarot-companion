@@ -11,7 +11,7 @@ import { Engine } from '../src/engine.mjs';
 
 const deck = [{ id: 'fool', zh: '愚者', en: 'The Fool' }];
 const spreads = [{ id: 'one', zh: '单牌', en: 'One', count: 1, slots: [{ label: '当下', hint: 'Current' }] }];
-async function fixture(t) {
+async function fixture(t, engineFactory) {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'companion-http-')));
   const publicDir = path.join(root, 'public');
   await fs.mkdir(path.join(publicDir, 'js'), { recursive: true });
@@ -41,7 +41,7 @@ async function fixture(t) {
   });
   await new Promise(r => upstream.listen(0, '127.0.0.1', r));
   let starts = 0;
-  const engine = { root, close: async () => {}, catalog: async () => ({ deck, spreads,
+  const engine = engineFactory ? await engineFactory(root) : { root, close: async () => {}, catalog: async () => ({ deck, spreads,
     buildReadingMessages: ({ question, placed }) => [{ role: 'system', content: 'Original builder' }, { role: 'user', content: question + ':' + placed[0].card.zh }],
     buildIdentifyMessages: dataUrl => [{ role: 'user', content: [{ type: 'image_url', image_url: { url: dataUrl } }] }],
   }), request: (route, options) => { starts++; return fetch(`http://127.0.0.1:${upstream.address().port}${route}`, options); } };
@@ -88,9 +88,69 @@ async function fixture(t) {
   const proxy = (client, route, body, cookie = client.cookie) => fetch(origin + route, { method: body ? 'POST' : 'GET', headers: {
     connection: 'close', origin, cookie, 'x-tarot-request': '1', 'x-companion-session': client.id, ...(body ? { 'content-type': 'application/json' } : {}),
   }, ...(body ? { body: JSON.stringify(body) } : {}) });
-  return { root, origin, service, admin, invite, post, accept, revealed, session, calls, reenter, restart, proxy,
+  return { root, origin, service, engine, admin, invite, post, accept, revealed, session, calls, reenter, restart, proxy,
     starts: () => starts, mode: value => { mode = value; }, cancelled: () => cancelled, release: () => { for (const response of held) response.end(); } };
 }
+
+test('normal service close drains accepted original proxies before releasing engine ownership', async t => {
+  for (const phase of ['initial-probe', 'owned-request']) await t.test(phase, async t => {
+    const f = await fixture(t, async root => {
+      await fs.writeFile(path.join(root, 'server.mjs'), `import http from 'node:http';
+        http.createServer((req,res)=>res.end(JSON.stringify({protocol:'cove-tarot-engine-v1',engine:'tarot',version:1})))
+          .listen(Number(process.env.PORT),'127.0.0.1');`);
+      const reservation = http.createServer(); await new Promise(r => reservation.listen(0, '127.0.0.1', r));
+      const port = reservation.address().port; await new Promise(r => reservation.close(r));
+      return new Engine({ root, port, token: 'synthetic-token', environment: { HOME: root } });
+    });
+    const client = await f.accept(await f.invite());
+    if (phase === 'owned-request') await f.engine.start();
+    const pid = f.engine.pid;
+    const originalFetch = globalThis.fetch;
+    const entered = Promise.withResolvers(); const release = Promise.withResolvers();
+    const request = f.engine.request.bind(f.engine); let operation;
+    f.engine.request = (...args) => (operation = request(...args));
+    const route = phase === 'initial-probe' ? '/api/companion-health' : '/api/dsh';
+    let held = true; let closed = false;
+    globalThis.fetch = async (...args) => {
+      if (held && args[0] === f.engine.origin + route) { held = false; entered.resolve(); await release.promise; }
+      return originalFetch(...args);
+    };
+    const proxy = f.proxy(client, '/api/dsh').then(response => response.text(), () => 'cancelled').catch(() => 'cancelled');
+    let closing;
+    try {
+      await entered.promise;
+      closing = f.service.close().then(() => { closed = true; });
+      await new Promise(r => setTimeout(r, 25));
+      assert.equal(closed, false, 'service must drain even a proxy whose response is already destroyed');
+      release.resolve(); await Promise.all([proxy, closing]); await Promise.allSettled([operation]);
+      assert.equal(f.engine.pid, null);
+      if (pid) assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+      await assert.rejects(originalFetch(f.engine.origin), /fetch failed/);
+      await assert.rejects(originalFetch(f.origin), /fetch failed/);
+    } finally {
+      release.resolve(); await Promise.all([proxy, closing]); await Promise.allSettled([operation]); globalThis.fetch = originalFetch;
+      if (closed && f.engine.pid) await f.engine.close();
+    }
+  });
+});
+
+test('normal service close drains a reading catalog continuation without claiming work', async t => {
+  const f = await fixture(t); const client = await f.revealed(await f.invite());
+  const catalog = f.engine.catalog;
+  const entered = Promise.withResolvers(); const release = Promise.withResolvers();
+  f.engine.catalog = async () => { entered.resolve(); await release.promise; return catalog(); };
+  const reading = f.post(client, 'reading', { action_id: 'closing-read', model: 'synthetic' });
+  let closing;
+  try {
+    await entered.promise; closing = f.service.close();
+    await new Promise(r => setTimeout(r, 25)); release.resolve();
+    const response = await reading; await response.text(); await closing;
+    assert.equal(response.status, 503);
+    assert.equal(f.starts(), 0, 'no paid worker may begin after close starts');
+    const stored = new Store(path.join(f.root, 'state.sqlite'));
+    try { assert.equal(stored.session(client.id).reading, null); } finally { stored.close(); }
+  } finally { release.resolve(); await Promise.allSettled([reading, closing]); }
+});
 
 test('consent, exact origin/host, CSRF, scoped cookies and static containment protect records', async t => {
   const f = await fixture(t);

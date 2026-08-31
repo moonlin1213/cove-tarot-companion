@@ -153,7 +153,9 @@ export async function createService({ config, store: storeOrFactory, engine }) {
         return json(res, session);
       }
       if (action === 'reading') {
-        const catalog = await engine.catalog(); const session = store.session(id);
+        const catalog = await engine.catalog();
+        guard(req); // A catalog continuation must not claim/start work during close.
+        const session = store.session(id);
         if (session.phase !== 'revealed') throw fail(409);
         const spread = catalog.spreads.find(item => item.id === session.spread_id);
         const messages = catalog.buildReadingMessages({ question: session.question, spread,
@@ -182,22 +184,25 @@ export async function createService({ config, store: storeOrFactory, engine }) {
       operation.controller.signal.addEventListener('abort', () => res.destroy(), { once: true });
       res.once('close', abort); proxies.add(operation);
       try {
-        let body = get ? null : await readBody(req, 4 * 1024 * 1024);
-        if (pathname === '/api/chat') {
-          // Only the original photo identifier may bypass the durable read claim.
-          const parts = body.messages?.flatMap(message => Array.isArray(message.content) ? message.content : []);
-          const dataUrl = parts?.find(part => part.type === 'image_url')?.image_url?.url;
-          if (typeof dataUrl !== 'string' || !/^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) throw fail(400);
-          body = { ...body, messages: (await engine.catalog()).buildIdentifyMessages(dataUrl) };
-        }
-        // Consent may have been revoked while uploading or loading the catalog.
-        operation.controller.signal.throwIfAborted(); activeProxyBinding(req);
-        const response = await engine.request(pathname, { method: req.method, headers: { 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.any([operation.controller.signal, AbortSignal.timeout(125000)]) });
-        if (!response.ok) { await response.body?.cancel(); throw fail(response.status); }
-        res.writeHead(response.status, { 'content-type': response.headers.get('content-type') || 'application/json' });
-        let size = 0;
-        for await (const chunk of response.body) { size += chunk.length; if (size > 4 * 1024 * 1024 || res.destroyed || res.writableLength > 262144) break; res.write(chunk); }
-        return res.end();
+        operation.promise = (async () => {
+          let body = get ? null : await readBody(req, 4 * 1024 * 1024);
+          if (pathname === '/api/chat') {
+            // Only the original photo identifier may bypass the durable read claim.
+            const parts = body.messages?.flatMap(message => Array.isArray(message.content) ? message.content : []);
+            const dataUrl = parts?.find(part => part.type === 'image_url')?.image_url?.url;
+            if (typeof dataUrl !== 'string' || !/^data:image\/(jpeg|png|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) throw fail(400);
+            body = { ...body, messages: (await engine.catalog()).buildIdentifyMessages(dataUrl) };
+          }
+          // Consent may have been revoked while uploading or loading the catalog.
+          operation.controller.signal.throwIfAborted(); activeProxyBinding(req);
+          const response = await engine.request(pathname, { method: req.method, headers: { 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}), signal: AbortSignal.any([operation.controller.signal, AbortSignal.timeout(125000)]) });
+          if (!response.ok) { await response.body?.cancel(); throw fail(response.status); }
+          res.writeHead(response.status, { 'content-type': response.headers.get('content-type') || 'application/json' });
+          let size = 0;
+          for await (const chunk of response.body) { size += chunk.length; if (size > 4 * 1024 * 1024 || res.destroyed || res.writableLength > 262144) break; res.write(chunk); }
+          return res.end();
+        })();
+        return await operation.promise;
       } finally {
         res.off('close', abort); proxies.delete(operation);
       }
@@ -283,7 +288,7 @@ export async function createService({ config, store: storeOrFactory, engine }) {
       for (const worker of workers.values()) worker.controller.abort();
       for (const operation of proxies) operation.controller.abort();
       for (const res of streams) res.end();
-      await Promise.all([...workers.values()].map(worker => worker.promise));
+      await Promise.allSettled([...workers.values(), ...proxies].map(operation => operation.promise));
       await engine.close();
       server.closeIdleConnections();
       await new Promise(r => server.close(r));

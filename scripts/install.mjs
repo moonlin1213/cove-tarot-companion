@@ -2,6 +2,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -15,6 +16,17 @@ const SOURCE = 'https://github.com/moonlin1213/tarot-ritual.git';
 const packageDirectory = fileURLToPath(new URL('..', import.meta.url));
 const overlap = (a, b) => a === b || a.startsWith(b + path.sep) || b.startsWith(a + path.sep);
 async function exists(filename) { try { await fs.lstat(filename); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } }
+async function requireStoppedEngine(config) {
+  if (!config) return;
+  const free = await new Promise(resolve => {
+    const socket = net.connect({ host: '127.0.0.1', port: config.enginePort });
+    const finish = value => { socket.destroy(); resolve(value); };
+    socket.once('connect', () => finish(false));
+    socket.once('error', error => finish(error.code === 'ECONNREFUSED'));
+    socket.setTimeout(1000, () => finish(false));
+  });
+  if (!free) throw new Error('Engine port is occupied or cannot be verified free; installation unchanged. Stop its known owner or terminal and retry. If no trusted owner remains after a crash, save work and restart the computer before retrying. Never kill a process guessed from its port.');
+}
 async function destination(skillDir, dataDir, packageRoot) {
   for (const item of [skillDir, dataDir]) {
     if ([path.parse(item).root, os.homedir(), process.cwd(), packageRoot].includes(item) || item.split(path.sep).filter(Boolean).length < 2) throw new Error('Unsafe installation destination');
@@ -101,6 +113,7 @@ export async function install({ dataDir = defaultDataDir(), skillDir, packageRoo
       if (!previous) return { state: 'not-installed', dataDir };
       if (config && await probeService(config)) throw new Error('Stop the owned service before uninstall');
       if (!previous.unchanged) return { state: 'retained-modified', dataDir, retainedCode: skillDir };
+      await requireStoppedEngine(config);
       retainedCode = skillDir + '.uninstalled-' + randomUUID();
       await fs.rename(skillDir, retainedCode);
       return { state: 'uninstalled', dataDir, retainedCode };
@@ -116,6 +129,7 @@ export async function install({ dataDir = defaultDataDir(), skillDir, packageRoo
     }
     if (config && await probeService(config)) throw new Error('Stop the owned service before updating');
     if (config && config.engineRoot !== path.join(skillDir, 'engine')) throw new Error('Existing data directory belongs to another code destination');
+    await requireStoppedEngine(config);
     await fs.mkdir(path.dirname(skillDir), { recursive: true });
     stage = await fs.mkdtemp(path.join(path.dirname(skillDir), '.companion-stage-'));
     const engineRoot = path.join(stage, 'engine');
@@ -135,6 +149,8 @@ export async function install({ dataDir = defaultDataDir(), skillDir, packageRoo
     catch { throw new Error('Pinned engine npm ci failed; installation unchanged'); }
     await copyPackage(packageRoot, stage);
     await fs.writeFile(path.join(stage, OWNER), JSON.stringify({ protocol: 'cove-tarot-owned-v1', commit: manifest.commit, files: await snapshot(stage) }), { mode: 0o600, flag: 'wx' });
+    // Keep the install lock through both the final occupancy check and switch.
+    await requireStoppedEngine(config);
     if (previous) { retainedCode = skillDir + '.previous-' + randomUUID(); await fs.rename(skillDir, retainedCode); }
     try {
       await fs.rename(stage, skillDir); switched = true; stage = null;
