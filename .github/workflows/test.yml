@@ -1,0 +1,34 @@
+name: Test public companion
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  original-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Audit proposed source history, not GitHub's synthetic PR merge author.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Audit complete public history and tracked content
+        run: node scripts/check-release.mjs
+      - name: Install exact public engine through the user installer
+        run: node scripts/install.mjs --skill-dir "$RUNNER_TEMP/companion-skill" --data-dir "$RUNNER_TEMP/companion-data"
+      - name: Regression with actual engine
+        run: npm test
+        env:
+          TAROT_TEST_ENGINE_ROOT: ${{ runner.temp }}/companion-skill/engine
+      - name: Install isolated browser test dependency
+        run: npm install --no-save --package-lock=false --ignore-scripts playwright@1.62.1
+      - run: npx playwright install --with-deps chromium webkit
+      - name: Real Chromium and WebKit original UI gates
+        run: node --test test/browser.test.mjs
+        env:
+          TAROT_TEST_BROWSER: '1'
+          TAROT_TEST_ENGINE_ROOT: ${{ runner.temp }}/companion-skill/engine

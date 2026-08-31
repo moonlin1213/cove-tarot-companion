@@ -1,0 +1,6 @@
+interface:
+  display_name: "Cove Tarot Companion"
+  short_description: "Local Tarot rituals and original-reading companionship"
+  default_prompt: "Use $cove-tarot-companion to invite me to a local Tarot ritual and discuss its original reading afterward."
+policy:
+  allow_implicit_invocation: true
