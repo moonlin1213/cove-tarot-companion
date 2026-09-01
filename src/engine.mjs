@@ -1,7 +1,7 @@
-import { spawn } from 'node:child_process';
 import net from 'node:net';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { spawnOwned, stopOwnedChild } from './platform.mjs';
 
 const ROUTES = new Set(['/api/dsh', '/api/dsh/import', '/api/models', '/api/chat', '/api/companion-health']);
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -14,9 +14,12 @@ export class Engine {
   #closing = null;
   #generation = 0;
   #catalog;
-  constructor({ root, executable = process.execPath, port, token, environment = process.env }) {
+  #platform;
+  #spawnImplementation;
+  constructor({ root, executable = process.execPath, port, token, environment = process.env, platform = process.platform, spawnImplementation }) {
     if (!path.isAbsolute(root) || !path.isAbsolute(executable) || !Number.isInteger(port) || port < 1024 || port > 65535 || !token) throw new Error('Invalid fixed engine configuration');
     this.root = root; this.executable = executable; this.port = port; this.token = token;
+    this.#platform = platform; this.#spawnImplementation = spawnImplementation;
     this.environment = { ...environment, PORT: String(port), COVE_TAROT_COMPANION_TOKEN: token, TAROT_DSH_IMPORT: '0' };
     this.origin = `http://127.0.0.1:${port}`;
   }
@@ -69,7 +72,9 @@ export class Engine {
     if (identified) return;
     const occupied = await this.#occupied(); check();
     if (occupied) throw new Error('Engine port occupied by an unauthenticated service');
-    const child = spawn(this.executable, ['--use-env-proxy', 'server.mjs'], { cwd: this.root, env: this.environment, stdio: 'ignore' });
+    const child = spawnOwned(this.executable, ['--use-env-proxy', 'server.mjs'], {
+      cwd: this.root, env: this.environment, stdio: 'ignore', platform: this.#platform, spawnImplementation: this.#spawnImplementation,
+    });
     this.#child = child;
     let failed = false;
     child.once('error', () => { failed = true; });
@@ -104,15 +109,7 @@ export class Engine {
     return this.#closing;
   }
   async #stopChild(child) {
-    if (!child?.pid || child.exitCode !== null || child.signalCode !== null) {
-      if (this.#child === child) this.#child = null;
-      return;
-    }
-    await new Promise(resolve => {
-      const timer = setTimeout(() => child.kill('SIGKILL'), 1500);
-      child.once('exit', () => { clearTimeout(timer); resolve(); });
-      child.kill('SIGTERM');
-    });
+    await stopOwnedChild(child, { platform: this.#platform });
     if (this.#child === child) this.#child = null;
   }
 }

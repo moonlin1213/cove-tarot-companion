@@ -5,9 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import vm from 'node:vm';
+import { EventEmitter } from 'node:events';
 import { createService } from '../src/server.mjs';
 import { Store } from '../src/store.mjs';
 import { Engine } from '../src/engine.mjs';
+import { stopOwnedChild } from '../src/platform.mjs';
 
 const deck = [{ id: 'fool', zh: '愚者', en: 'The Fool' }];
 const spreads = [{ id: 'one', zh: '单牌', en: 'One', count: 1, slots: [{ label: '当下', hint: 'Current' }] }];
@@ -91,6 +93,71 @@ async function fixture(t, engineFactory) {
   return { root, origin, service, engine, admin, invite, post, accept, revealed, session, calls, reenter, restart, proxy,
     starts: () => starts, mode: value => { mode = value; }, cancelled: () => cancelled, release: () => { for (const response of held) response.end(); } };
 }
+
+test('authenticated stop reports an unverifiable retained-child exit, stays retryable, and never leaks or rejects unhandled', async t => {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'companion-stop-failure-')));
+  const retained = new EventEmitter();
+  Object.assign(retained, { pid: 4242, exitCode: null, signalCode: null, kill: () => true });
+  const engine = {
+    root,
+    close: () => stopOwnedChild(retained, { platform: 'linux', graceMs: 5 }),
+  };
+  const store = new Store(path.join(root, 'state.sqlite'));
+  const service = await createService({
+    config: { servicePort: 0, adminToken: 'synthetic-admin-secret', installationId: 'synthetic-installation' },
+    store,
+    engine,
+  });
+  const unhandled = [];
+  const onUnhandled = error => unhandled.push(error);
+  process.on('unhandledRejection', onUnhandled);
+  const stop = () => fetch(service.origin + '/companion/v1/stop-service', {
+    method: 'POST',
+    headers: { connection: 'close', authorization: 'Bearer synthetic-admin-secret', 'content-type': 'application/json' },
+    body: '{}',
+  });
+  t.after(async () => {
+    process.off('unhandledRejection', onUnhandled);
+    retained.signalCode ||= 'SIGKILL'; retained.emit('exit', null, retained.signalCode);
+    service.server.closeAllConnections();
+    await new Promise(resolve => service.server.close(() => resolve()));
+    try { store.close(); } catch {}
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  const failed = await stop();
+  const failureText = await failed.text();
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(failed.status, 503);
+  assert.ok(Buffer.byteLength(failureText) <= 1024);
+  assert.match(failureText, /not.*verif|unverified|retry/i);
+  assert.doesNotMatch(failureText, /synthetic-admin-secret|4242/);
+  assert.deepEqual(unhandled, []);
+  assert.equal((await fetch(service.origin + '/companion/v1/health', { headers: { authorization: 'Bearer synthetic-admin-secret' } })).status, 200,
+    'a failed admin shutdown must remain available for a documented retry');
+
+  retained.signalCode = 'SIGKILL'; retained.emit('exit', null, retained.signalCode);
+  const retried = await stop();
+  assert.equal(retried.status, 200);
+  assert.deepEqual(await retried.json(), { stopped: true });
+});
+
+test('programmatic close finalizes the HTTP owner and store even when engine close rejects', async t => {
+  let storeClosed = 0;
+  const store = { close: () => { storeClosed += 1; } };
+  const service = await createService({
+    config: { servicePort: 0, adminToken: 'synthetic-admin-secret', installationId: 'synthetic-installation' },
+    store,
+    engine: { close: async () => { throw new Error('synthetic engine shutdown failure'); } },
+  });
+  t.after(async () => {
+    service.server.closeAllConnections();
+    await new Promise(resolve => service.server.close(() => resolve()));
+  });
+  await assert.rejects(service.close(), /synthetic engine shutdown failure/);
+  assert.equal(storeClosed, 1);
+  await assert.rejects(fetch(service.origin), /fetch failed/);
+});
 
 test('normal service close drains accepted original proxies before releasing engine ownership', async t => {
   for (const phase of ['initial-probe', 'owned-request']) await t.test(phase, async t => {

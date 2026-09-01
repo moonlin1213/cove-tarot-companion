@@ -4,8 +4,89 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import { EventEmitter, once } from 'node:events';
 import { Engine } from '../src/engine.mjs';
 import { loadConfig, writeConfig, assertRuntime, secureFile } from '../src/config.mjs';
+import { spawnOwned, stopOwnedChild } from '../src/platform.mjs';
+
+test('owned process spawning preserves argument boundaries and forces native hidden shell-free execution', () => {
+  const calls = [];
+  const child = {};
+  assert.equal(spawnOwned('C:\\Program Files\\node.exe', ['server file.mjs', '中文'], {
+    platform: 'win32', cwd: 'C:\\Tarot Companion', env: { SYNTHETIC: '1' },
+    spawnImplementation: (...args) => { calls.push(args); return child; },
+  }), child);
+  assert.deepEqual(calls, [[
+    'C:\\Program Files\\node.exe',
+    ['server file.mjs', '中文'],
+    { cwd: 'C:\\Tarot Companion', env: { SYNTHETIC: '1' }, shell: false, windowsHide: true },
+  ]]);
+});
+
+test('engine launch reaches the platform boundary with exact argv and closes its retained handle', async () => {
+  const originalFetch = globalThis.fetch;
+  const child = new EventEmitter();
+  Object.assign(child, { pid: 424242, exitCode: null, signalCode: null });
+  child.kill = signal => {
+    child.signalCode = signal || 'terminated';
+    child.emit('exit', null, child.signalCode);
+    return true;
+  };
+  const calls = []; let launched = false;
+  globalThis.fetch = async () => {
+    if (!launched) throw new Error('not running');
+    return Response.json({ protocol: 'cove-tarot-engine-v1', engine: 'tarot', version: 1 });
+  };
+  const engine = new Engine({
+    root: path.resolve(os.tmpdir()), executable: path.resolve(process.execPath), port: 18641, token: 'synthetic', platform: 'win32',
+    spawnImplementation: (...args) => { calls.push(args); launched = true; return child; },
+  });
+  try {
+    await engine.start();
+    assert.deepEqual(calls, [[process.execPath, ['--use-env-proxy', 'server.mjs'], {
+      cwd: path.resolve(os.tmpdir()), env: engine.environment, stdio: 'ignore', shell: false, windowsHide: true,
+    }]]);
+    await engine.close();
+    assert.equal(engine.pid, null);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('owned shutdown terminates a real retained child and leaves an unrelated loopback server alive', async t => {
+  const unrelated = http.createServer((req, res) => res.end('unrelated'));
+  await new Promise(resolve => unrelated.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => unrelated.close(resolve)));
+  const child = spawnOwned(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill(); });
+  await once(child, 'spawn');
+  await stopOwnedChild(child, { platform: process.platform, graceMs: 250 });
+  assert.notEqual(child.exitCode ?? child.signalCode, null);
+  assert.equal(await (await fetch(`http://127.0.0.1:${unrelated.address().port}`)).text(), 'unrelated');
+});
+
+test('POSIX owned shutdown escalates through the same child handle after its grace period', async () => {
+  const child = new EventEmitter();
+  Object.assign(child, { pid: 12, exitCode: null, signalCode: null });
+  const signals = [];
+  child.kill = signal => {
+    signals.push(signal);
+    if (signal === 'SIGKILL') {
+      child.signalCode = signal;
+      child.emit('exit', null, signal);
+    }
+    return true;
+  };
+  await stopOwnedChild(child, { platform: 'linux', graceMs: 5 });
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
+});
+
+test('Windows owned shutdown fails explicitly when its retained handle cannot confirm exit', async () => {
+  const child = new EventEmitter();
+  Object.assign(child, { pid: 12, exitCode: null, signalCode: null });
+  const signals = [];
+  child.kill = (...args) => { signals.push(args); return true; };
+  await assert.rejects(stopOwnedChild(child, { platform: 'win32', graceMs: 5 }), /owned child.*exit|shutdown/i);
+  assert.deepEqual(signals, [[]]);
+});
 
 test('a missing engine executable rejects startup instead of leaving an unclosable child', async () => {
   const engine = new Engine({ root: os.tmpdir(), executable: path.join(os.tmpdir(), 'nonexistent-companion-executable'), port: 18641, token: 'synthetic' });
@@ -45,6 +126,9 @@ async function fixture(t) {
 
 test('engine starts once on demand with proxy flag, closes only its child, and cold restarts', async t => {
   const { engine } = await fixture(t);
+  const unrelated = http.createServer((req, res) => res.end('unrelated'));
+  await new Promise(resolve => unrelated.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => unrelated.close(resolve)));
   assert.equal(engine.pid, null);
   await Promise.all([engine.start(), engine.start(), engine.start()]);
   const pid = engine.pid;
@@ -54,6 +138,7 @@ test('engine starts once on demand with proxy flag, closes only its child, and c
   await engine.close();
   assert.equal(engine.pid, null);
   assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+  assert.equal(await (await fetch(`http://127.0.0.1:${unrelated.address().port}`)).text(), 'unrelated');
   await engine.start();
   assert.notEqual(engine.pid, pid);
 });
@@ -167,10 +252,17 @@ test('config enforces runtime floor, private regular secrets and stable installa
   const second = await loadConfig(dataDir);
   assert.equal(first.adminToken, second.adminToken);
   assert.equal(first.origin, second.origin);
-  assert.equal((await fs.stat(path.join(dataDir, 'config.json'))).mode & 0o077, 0);
-  await fs.chmod(path.join(dataDir, 'config.json'), 0o644);
-  await assert.rejects(loadConfig(dataDir), /private|permission/i);
+  if (process.platform !== 'win32') {
+    assert.equal((await fs.stat(path.join(dataDir, 'config.json'))).mode & 0o077, 0);
+    await fs.chmod(path.join(dataDir, 'config.json'), 0o644);
+    await assert.rejects(loadConfig(dataDir), /private|permission/i);
+  }
   const link = path.join(root, 'secret-link');
-  await fs.symlink(path.join(dataDir, 'config.json'), link);
-  await assert.rejects(secureFile(link), /regular|symlink/i);
+  if (process.platform === 'win32') {
+    await fs.symlink(dataDir, link, 'junction');
+    await assert.rejects(secureFile(path.join(link, 'config.json')), /regular|link|reparse|symlink/i);
+  } else {
+    await fs.symlink(path.join(dataDir, 'config.json'), link);
+    await assert.rejects(secureFile(link), /regular|symlink/i);
+  }
 });

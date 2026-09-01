@@ -6,21 +6,59 @@ A consent-first, local companion bridge for [Tarot Ritual](https://github.com/mo
 
 ## Install the whole package
 
-Requirements: Node **24.5 or newer**, npm, Git, network access for installation, and a local desktop browser with WebGL2. Your agent needs existing shell/browser capabilities on that same computer; a remote cloud-only agent cannot open your loopback service. The installer does not install system runtimes or change global proxies.
+Requirements: Node **24.5 or newer**, npm, Git, network access for installation, and a local desktop browser with WebGL2. Your agent needs existing shell/browser capabilities on that same computer; a remote cloud-only agent cannot open your loopback service. The installer does not install Node, Git, or a browser and does not change global proxies.
 
-Clone the release and choose a host-discoverable skill directory. This POSIX-shell example uses the common `.agents/skills` location; change it if your host uses a different directory.
+The current release gate covers Windows 10/11 x64, macOS Intel x64, macOS Apple Silicon arm64, and Linux x64. Windows uses native system PowerShell and needs **neither WSL nor Git Bash**. Docker, Python, global npm packages, and locally compiled npm extensions are not required. The commands below use the common `.agents/skills` discovery directory; if your host uses another one, replace only `SkillDir`.
 
-```sh
-git clone https://github.com/moonlin1213/cove-tarot-companion.git
-cd cove-tarot-companion
-node scripts/install.mjs --skill-dir "$HOME/.agents/skills/cove-tarot-companion"
-cd "$HOME/.agents/skills/cove-tarot-companion"
-node scripts/companion.mjs doctor
+### macOS / Linux (Bash)
+
+Install:
+
+```bash
+SOURCE_DIR="$HOME/cove-tarot-companion"
+SKILL_DIR="$HOME/.agents/skills/cove-tarot-companion"
+DATA_DIR="$HOME/.local/share/cove-tarot-companion"
+git clone https://github.com/moonlin1213/cove-tarot-companion.git "$SOURCE_DIR"
+cd "$SOURCE_DIR"
+node scripts/install.mjs --skill-dir "$SKILL_DIR" --data-dir "$DATA_DIR"
+```
+
+Doctor:
+
+```bash
+SKILL_DIR="$HOME/.agents/skills/cove-tarot-companion"
+DATA_DIR="$HOME/.local/share/cove-tarot-companion"
+cd "$SKILL_DIR"
+node scripts/companion.mjs doctor --data-dir "$DATA_DIR"
+```
+
+### Windows 10/11 x64 (PowerShell)
+
+Install:
+
+```powershell
+$SourceDir = Join-Path $env:USERPROFILE 'cove-tarot-companion'
+$SkillDir = Join-Path $env:USERPROFILE '.agents\skills\cove-tarot-companion'
+$DataDir = Join-Path $env:LOCALAPPDATA 'cove-tarot-companion'
+git clone https://github.com/moonlin1213/cove-tarot-companion.git $SourceDir
+Set-Location $SourceDir
+node scripts/install.mjs --skill-dir $SkillDir --data-dir $DataDir
+```
+
+Doctor:
+
+```powershell
+$SkillDir = Join-Path $env:USERPROFILE '.agents\skills\cove-tarot-companion'
+$DataDir = Join-Path $env:LOCALAPPDATA 'cove-tarot-companion'
+Set-Location $SkillDir
+node scripts/companion.mjs doctor --data-dir $DataDir
 ```
 
 **Copying only SKILL.md is not installation.** The installer copies the connector/skill, fetches the exact public commit in `engine-lock.json`, verifies Git HEAD and runs the engine's locked `npm ci --ignore-scripts`. No floating-branch updates, private source fallback, model request or account import occurs. An unavailable pin fails closed without replacing a working installation. If your host offers a generic skill-copy installer, still run this package's installation step and let the host discover the resulting folder.
 
-Private state/config defaults to `.local/share/cove-tarot-companion` beneath the OS home directory. For an explicit location, pass `--data-dir /chosen/private-data` to the installer and **every** CLI command. Keep code and data directories separate. Generated secrets stay in owner-only local files, not URLs or chat prompts. Ports default to 18642/18643; unrelated occupants are never taken over. Live port/config migration is unsupported.
+Private state/config defaults differ by platform: `~/.local/share/cove-tarot-companion` on macOS/Linux and `%LOCALAPPDATA%\cove-tarot-companion` on Windows. You may pass a private local `--data-dir` during installation, but then pass the **same argument to every CLI command**. If Windows cannot resolve `LOCALAPPDATA`, installation fails explicitly instead of guessing a public directory. Private data must be on a filesystem whose local locking and replacement semantics can be verified; network, device, FUSE-style and unknown volumes fail closed. Keep source, installed code and data directories separate. Generated secrets stay in verified owner-private local files, not URLs or chat prompts. Ports default to 18642/18643; unrelated occupants are never taken over. Live port/config migration is unsupported.
+
+This release contract excludes Windows ARM, UNC/network or other data directories whose private permissions and atomic replacement cannot be verified, GUI installers, mobile platforms, system-level automatic updates, and default startup services. Windows ARM may happen to work when its pure-Node capabilities are sufficient, but it is outside the support statement and release acceptance.
 
 ## First ritual and your own provider
 
@@ -51,24 +89,69 @@ Events are paginated: `{events,next_cursor,has_more}`. Results contain only reve
 
 ## Stop, update and uninstall
 
-```sh
-node scripts/companion.mjs stop-service
-# Leave the installed folder; substitute your separate reviewed release checkout:
-cd /chosen/reviewed-release/cove-tarot-companion
-node scripts/install.mjs --skill-dir "$HOME/.agents/skills/cove-tarot-companion" --update
-# Or remove only owned code, retaining private data and recoverable code:
-node scripts/install.mjs --skill-dir "$HOME/.agents/skills/cove-tarot-companion" --uninstall
+The update commands below fast-forward the public source checkout. Review the fetched commit and diff before running the installer.
+
+Update on macOS/Linux (Bash):
+
+```bash
+SOURCE_DIR="$HOME/cove-tarot-companion"
+SKILL_DIR="$HOME/.agents/skills/cove-tarot-companion"
+DATA_DIR="$HOME/.local/share/cove-tarot-companion"
+cd "$SKILL_DIR"
+node scripts/companion.mjs stop-service --data-dir "$DATA_DIR"
+git -C "$SOURCE_DIR" pull --ff-only
+cd "$SOURCE_DIR"
+node scripts/install.mjs --skill-dir "$SKILL_DIR" --data-dir "$DATA_DIR" --update
+```
+
+Update on Windows (PowerShell):
+
+```powershell
+$SourceDir = Join-Path $env:USERPROFILE 'cove-tarot-companion'
+$SkillDir = Join-Path $env:USERPROFILE '.agents\skills\cove-tarot-companion'
+$DataDir = Join-Path $env:LOCALAPPDATA 'cove-tarot-companion'
+Set-Location $SkillDir
+node scripts/companion.mjs stop-service --data-dir $DataDir
+git -C $SourceDir pull --ff-only
+Set-Location $SourceDir
+node scripts/install.mjs --skill-dir $SkillDir --data-dir $DataDir --update
+```
+
+Uninstall on macOS/Linux (Bash):
+
+```bash
+SOURCE_DIR="$HOME/cove-tarot-companion"
+SKILL_DIR="$HOME/.agents/skills/cove-tarot-companion"
+DATA_DIR="$HOME/.local/share/cove-tarot-companion"
+cd "$SKILL_DIR"
+node scripts/companion.mjs stop-service --data-dir "$DATA_DIR"
+cd "$SOURCE_DIR"
+node scripts/install.mjs --skill-dir "$SKILL_DIR" --data-dir "$DATA_DIR" --uninstall
+```
+
+Uninstall on Windows (PowerShell):
+
+```powershell
+$SourceDir = Join-Path $env:USERPROFILE 'cove-tarot-companion'
+$SkillDir = Join-Path $env:USERPROFILE '.agents\skills\cove-tarot-companion'
+$DataDir = Join-Path $env:LOCALAPPDATA 'cove-tarot-companion'
+Set-Location $SkillDir
+node scripts/companion.mjs stop-service --data-dir $DataDir
+Set-Location $SourceDir
+node scripts/install.mjs --skill-dir $SkillDir --data-dir $DataDir --uninstall
 ```
 
 Run updates from a newly downloaded, reviewed release, after stopping this installation's service. An unchanged repeat install is idempotent. User-modified code or custom artwork is protected: updates refuse to overwrite it, and uninstall retains modified code. Previous versions are retained in sibling recovery directories. State/config are not removed. A crash-left install lock fails closed; inspect before manual recovery.
 
 The next operational command starts the owned service as needed; there is no default startup agent. Normal stop closes the owned engine child. A hard-killed connector can leave an authenticated orphan engine, which a replacement can reuse but cannot stop through a child handle it never owned. No kill-by-port or unrelated-process cleanup is performed.
 
+`stop-service` reports `stopped: true` only after the owned engine child is confirmed terminated. If termination cannot be verified, it returns a bounded error and keeps the connector available so the command can be retried. Do not update or uninstall after that error. Retry once; if it persists, stop the connector from its known original terminal, or save work and restart the computer before retrying installation.
+
 Normal stop cancels and drains in-flight engine startup and proxy work. Update/uninstall requires a free engine port: even an authenticated orphan is refused before code switches, preventing new files from mixing with an old process. Stop it through its known original owner or terminal. If a crash left no trusted owner handle, save your work and restart the computer, then retry installation before starting the companion again. Never guess a process to terminate from its port. A harmless unchanged repeat installation remains available.
 
 ## Validation and scope
 
-`npm test` runs unit/integration tests. Actual-browser tests are opt-in and **must** be enabled for a release gate; skipped browser tests are not compatibility evidence. CI installs the exact engine through the package installer and runs Chromium/WebKit against an isolated fake loopback provider, including original manual provider setup, draw/batch reveal, saved refresh, return and a persisted synthetic host-message receipt. Paid providers, personal DSH profiles, arbitrary host brands, mobile browsers and Windows are not covered by those tests.
+`npm test` runs unit/integration tests. Actual-browser tests are opt-in and **must** be enabled for a release gate; skipped browser tests are not compatibility evidence. CI asserts platform/architecture on native Linux x64, Windows x64, macOS Intel x64, and macOS Apple Silicon arm64 runners, installs the exact engine through the package installer, and runs Chromium/WebKit against an isolated fake loopback provider, including original manual provider setup, draw/batch reveal, saved refresh, return and a persisted synthetic host-message receipt. Paid providers, personal DSH profiles, arbitrary host brands, and mobile browsers are not covered by those tests.
 
 ```sh
 # Run validation in the source checkout (installed skills omit test/ and .git):

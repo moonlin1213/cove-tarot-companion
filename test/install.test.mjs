@@ -6,6 +6,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { install } from '../scripts/install.mjs';
 import { loadConfig, writeConfig } from '../src/config.mjs';
 import { Engine } from '../src/engine.mjs';
@@ -13,7 +14,7 @@ import { Store } from '../src/store.mjs';
 import { DatabaseSync } from 'node:sqlite';
 
 const run = promisify(execFile);
-const cliScript = new URL('../scripts/companion.mjs', import.meta.url).pathname;
+const cliScript = fileURLToPath(new URL('../scripts/companion.mjs', import.meta.url));
 async function waitForFile(filename) {
   for (let i = 0; i < 500; i++) {
     try { await fs.stat(filename); return; } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -22,7 +23,7 @@ async function waitForFile(filename) {
   throw new Error('fixture did not reach its real filesystem switch');
 }
 async function fixture(t) {
-  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'companion-install-')));
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'companion install 占卜-')));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const source = path.join(root, 'source'); await fs.mkdir(source);
   const env = { ...process.env, HOME: root, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(root, 'no-global'), GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid', GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid' };
@@ -86,6 +87,79 @@ test('unsafe destinations and non-owned directories are rejected without overwri
   await assert.rejects(install({ ...options, skillDir: path.join(options.root, 'link') }), /symlink/i);
 });
 
+test('real installer rejects equality and nesting in both directions for every code/data/source pair before side effects', async t => {
+  const cases = [
+    ['skill equals data', async options => ({ skillDir: options.dataDir })],
+    ['data under skill', async options => ({ dataDir: path.join(options.skillDir, 'data') })],
+    ['skill under data', async options => ({ skillDir: path.join(options.dataDir, 'skill') })],
+    ['skill equals package', async options => ({ skillDir: options.packageRoot })],
+    ['skill under package', async options => ({ skillDir: path.join(options.packageRoot, 'skill') })],
+    ['package under skill', async options => {
+      const skillDir = path.join(options.root, 'code-parent');
+      const packageRoot = path.join(skillDir, 'package');
+      await fs.mkdir(skillDir); await fs.rename(options.packageRoot, packageRoot);
+      return { skillDir, packageRoot };
+    }],
+    ['data equals package', async options => ({ dataDir: options.packageRoot })],
+    ['data under package', async options => ({ dataDir: path.join(options.packageRoot, 'data') })],
+    ['package under data', async options => {
+      const dataDir = path.join(options.root, 'data-parent');
+      const packageRoot = path.join(dataDir, 'package');
+      await fs.mkdir(dataDir); await fs.rename(options.packageRoot, packageRoot);
+      return { dataDir, packageRoot };
+    }],
+  ];
+  for (const [name, prepare] of cases) await t.test(name, async t => {
+    const options = await fixture(t);
+    const selected = { ...options, ...await prepare(options) };
+    await assert.rejects(install(selected), /separate|overlap/i);
+    try {
+      const entries = await fs.readdir(path.dirname(selected.skillDir));
+      assert.equal(entries.some(entry => entry.startsWith('.companion-stage-')), false, 'overlap rejection must precede staging');
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    async function assertNoInstallerPrivateFiles(directory) {
+      try {
+        const names = await fs.readdir(directory);
+        assert.equal(names.includes('.install.lock'), false);
+        assert.equal(names.includes('config.json'), false);
+      } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    await assertNoInstallerPrivateFiles(selected.dataDir);
+  });
+});
+
+test('native macOS installer catches initially-missing case aliases after required parent creation', async t => {
+  if (process.platform !== 'darwin') return;
+  const options = await fixture(t);
+  const probe = path.join(options.root, 'CaseProbe');
+  await fs.mkdir(probe);
+  try {
+    try { await fs.lstat(path.join(options.root, 'caseprobe')); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  } finally { await fs.rmdir(probe); }
+  const skillDir = path.join(options.root, 'CaseIdentity');
+  const dataDir = path.join(options.root, 'caseidentity', 'private-data');
+  await assert.rejects(install({ ...options, skillDir, dataDir }), /separate|overlap/i);
+  assert.equal((await fs.readdir(options.root)).some(entry => entry.startsWith('.companion-stage-')), false);
+});
+
+test('installer reapplies unsafe root, canonical home and cwd guards without writing those destinations', async t => {
+  const options = await fixture(t);
+  await assert.rejects(install({ ...options, skillDir: path.parse(options.root).root }), /unsafe/i);
+  if (process.platform !== 'darwin') return;
+  const caseAlias = value => {
+    const parts = value.split(path.sep);
+    const index = parts.findIndex(Boolean);
+    parts[index] = [...parts[index]].map(character => character === character.toLowerCase() ? character.toUpperCase() : character.toLowerCase()).join('');
+    return parts.join(path.sep);
+  };
+  for (const target of [os.homedir(), process.cwd()]) {
+    const alias = caseAlias(target);
+    try { await fs.lstat(alias); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    await assert.rejects(install({ ...options, skillDir: alias }), /unsafe/i);
+  }
+});
+
 test('missing/wrong pin and failed npm ci never switch a working config or overwrite code', async t => {
   const options = await fixture(t); await install(options);
   const before = await fs.readFile(path.join(options.dataDir, 'config.json'), 'utf8');
@@ -106,7 +180,158 @@ test('missing/wrong pin and failed npm ci never switch a working config or overw
   assert.equal(await fs.readFile(path.join(options.dataDir, 'config.json'), 'utf8'), before);
 });
 
-test('npm generated executable symlinks are owned and verified without allowing private package symlinks', async t => {
+test('transient staged-directory sharing failures retry without changing the current code or config', async t => {
+  const options = await fixture(t);
+  await install(options);
+  const beforeConfig = await fs.readFile(path.join(options.dataDir, 'config.json'), 'utf8');
+  const beforeCode = await fs.readFile(path.join(options.skillDir, 'engine/server.mjs'), 'utf8');
+  const hook = path.join(options.root, 'transient-stage-lock.mjs');
+  await fs.writeFile(hook, `import fs from 'node:fs/promises';
+    const rename = fs.rename;
+    let failures = 0;
+    fs.rename = async (from, to) => {
+      if (process.platform === 'win32' && from.includes('.companion-stage-') && to === ${JSON.stringify(options.skillDir)} && failures < 2) {
+        failures += 1;
+        const error = new Error('scanner has the staged tree open');
+        error.code = 'EPERM';
+        throw error;
+      }
+      return rename(from, to);
+    };`);
+
+  const result = await run(process.execPath, ['--import', hook, path.join(options.packageRoot, 'scripts/install.mjs'), '--data-dir', options.dataDir, '--skill-dir', options.skillDir, '--update'], { env: options.environment, timeout: 30_000 });
+  assert.equal(JSON.parse(result.stdout).state, 'updated');
+  assert.equal(await fs.readFile(path.join(options.dataDir, 'config.json'), 'utf8'), beforeConfig);
+  assert.equal(await fs.readFile(path.join(options.skillDir, 'engine/server.mjs'), 'utf8'), beforeCode);
+});
+
+test('ordinary update does not rewrite an already-correct engineRoot configuration', async t => {
+  const options = await fixture(t); await install(options);
+  const beforeConfig = await fs.readFile(path.join(options.dataDir, 'config.json'));
+  const hook = path.join(options.root, 'correct-config-no-rewrite.mjs');
+  await fs.writeFile(hook, `import fs from 'node:fs/promises';
+    const rename = fs.rename;
+    fs.rename = async (from, to) => {
+      if (from.includes('.config-') && to.endsWith('config.json')) { const error = new Error('config rewrite unexpectedly attempted'); error.code = 'EPERM'; throw error; }
+      return rename(from, to);
+    };`);
+  const result = await run(process.execPath, ['--import', hook, path.join(options.packageRoot, 'scripts/install.mjs'), '--data-dir', options.dataDir, '--skill-dir', options.skillDir, '--update'], { env: options.environment, timeout: 30_000 });
+  assert.equal(JSON.parse(result.stdout).state, 'updated');
+  assert.deepEqual(await fs.readFile(path.join(options.dataDir, 'config.json')), beforeConfig);
+});
+
+test('permanent staged switch failure preserves byte-for-byte existing code and configuration', async t => {
+  const options = await fixture(t); await install(options);
+  const beforeCode = await fs.readFile(path.join(options.skillDir, 'engine/server.mjs'));
+  const beforeConfig = await fs.readFile(path.join(options.dataDir, 'config.json'));
+  const hook = path.join(options.root, 'permanent-switch-failure.mjs');
+  await fs.writeFile(hook, `import fs from 'node:fs/promises';
+    const rename = fs.rename;
+    fs.rename = async (from, to) => {
+      if (from.includes('.companion-stage-') && to === ${JSON.stringify(options.skillDir)}) {
+        const error = new Error('staged switch blocked'); error.code = 'EPERM'; throw error;
+      }
+      return rename(from, to);
+    };`);
+  await assert.rejects(run(process.execPath, ['--import', hook, path.join(options.packageRoot, 'scripts/install.mjs'), '--data-dir', options.dataDir, '--skill-dir', options.skillDir, '--update'], { env: options.environment, timeout: 30_000 }), /staged switch blocked/);
+  assert.deepEqual(await fs.readFile(path.join(options.skillDir, 'engine/server.mjs')), beforeCode);
+  assert.deepEqual(await fs.readFile(path.join(options.dataDir, 'config.json')), beforeConfig);
+  assert.equal((await install(options)).state, 'unchanged');
+});
+
+test('failed staging cleanup releases the lock while preserving the primary switch error and current install', async t => {
+  const options = await fixture(t); await install(options);
+  const beforeCode = await fs.readFile(path.join(options.skillDir, 'engine/server.mjs'));
+  const beforeConfig = await fs.readFile(path.join(options.dataDir, 'config.json'));
+  const hook = path.join(options.root, 'permanent-stage-cleanup-failure.mjs');
+  await fs.writeFile(hook, `import fs from 'node:fs/promises'; import path from 'node:path';
+    const rename = fs.rename; const rm = fs.rm;
+    fs.rename = async (from, to) => {
+      if (from.includes('.companion-stage-') && to === ${JSON.stringify(options.skillDir)}) {
+        const error = new Error('staged switch blocked'); error.code = 'EPERM'; throw error;
+      }
+      return rename(from, to);
+    };
+    fs.rm = async (target, options) => {
+      if (path.basename(String(target)).startsWith('.companion-stage-')) {
+        const error = new Error('staging cleanup held'); error.code = 'EPERM'; throw error;
+      }
+      return rm(target, options);
+    };`);
+  const error = await run(process.execPath, ['--import', hook, path.join(options.packageRoot, 'scripts/install.mjs'), '--data-dir', options.dataDir, '--skill-dir', options.skillDir, '--update'], { env: options.environment, timeout: 30_000 }).then(() => null, failure => failure);
+  assert.ok(error, 'the permanent switch failure must reject');
+  assert.match(error.stderr, /staged switch blocked/i);
+  assert.match(error.stderr, /staging.*retained/i);
+  assert.deepEqual(await fs.readFile(path.join(options.skillDir, 'engine/server.mjs')), beforeCode);
+  assert.deepEqual(await fs.readFile(path.join(options.dataDir, 'config.json')), beforeConfig);
+  assert.equal((await install(options)).state, 'unchanged');
+});
+
+test('fresh-install config failure quarantines the switched candidate away from the canonical path', async t => {
+  const options = await fixture(t);
+  const hook = path.join(options.root, 'fresh-config-failure.mjs');
+  await fs.writeFile(hook, `import fs from 'node:fs/promises';
+    const rename = fs.rename;
+    fs.rename = async (from, to) => {
+      if (from.includes('.config-') && to.endsWith('config.json')) { const error = new Error('fresh config switch blocked'); error.code = 'EPERM'; throw error; }
+      return rename(from, to);
+    };`);
+  const error = await run(process.execPath, ['--import', hook, path.join(options.packageRoot, 'scripts/install.mjs'), '--data-dir', options.dataDir, '--skill-dir', options.skillDir], { env: options.environment, timeout: 30_000 }).then(() => null, failure => failure);
+  assert.ok(error, 'the injected fresh-install config failure must reject');
+  assert.match(error.stderr, /fresh config switch blocked/i);
+  const failedCode = /candidate is retained at (.+?)(?=;|\.\n)/.exec(error.stderr)?.[1];
+  assert.ok(failedCode, 'error must name the quarantined candidate path');
+  assert.ok((await fs.stat(failedCode)).isDirectory());
+  await assert.rejects(fs.stat(options.skillDir), { code: 'ENOENT' });
+  await assert.rejects(fs.stat(path.join(options.dataDir, 'config.json')), { code: 'ENOENT' });
+});
+
+test('quarantine failure reports only the live canonical candidate and real previous path', async t => {
+  const options = await fixture(t); await install(options);
+  await fs.unlink(path.join(options.dataDir, 'config.json'));
+  const hook = path.join(options.root, 'quarantine-rollback-failure.mjs');
+  await fs.writeFile(hook, `import fs from 'node:fs/promises';
+    const rename = fs.rename;
+    fs.rename = async (from, to) => {
+      if (from.includes('.config-') && to.endsWith('config.json')) { const error = new Error('config switch blocked'); error.code = 'EPERM'; throw error; }
+      if (from === ${JSON.stringify(options.skillDir)} && to.includes('.failed-')) { const error = new Error('candidate quarantine blocked'); error.code = 'EPERM'; throw error; }
+      return rename(from, to);
+    };`);
+  const error = await run(process.execPath, ['--import', hook, path.join(options.packageRoot, 'scripts/install.mjs'), '--data-dir', options.dataDir, '--skill-dir', options.skillDir, '--update'], { env: options.environment, timeout: 30_000 }).then(() => null, failure => failure);
+  assert.ok(error, 'the injected quarantine failure must reject');
+  assert.ok(error.stderr.includes(`candidate remains at ${options.skillDir};`), 'error must name the exact live canonical candidate path');
+  assert.doesNotMatch(error.stderr, /candidate is retained at .*\.failed-/i);
+  const previous = /known-good previous code is retained at (.+?)(?=;|\.\n)/.exec(error.stderr)?.[1];
+  assert.ok(previous, 'error must name the real previous-code path');
+  assert.ok((await fs.stat(options.skillDir)).isDirectory());
+  assert.ok((await fs.stat(previous)).isDirectory());
+  await assert.rejects(fs.stat(path.join(options.dataDir, 'config.json')), { code: 'ENOENT' });
+});
+
+test('restore failure reports and retains both exact recovery directories', async t => {
+  const options = await fixture(t); await install(options);
+  await fs.unlink(path.join(options.dataDir, 'config.json'));
+  const hook = path.join(options.root, 'restore-rollback-failure.mjs');
+  await fs.writeFile(hook, `import fs from 'node:fs/promises';
+    const rename = fs.rename;
+    fs.rename = async (from, to) => {
+      if (from.includes('.config-') && to.endsWith('config.json')) { const error = new Error('config switch blocked'); error.code = 'EPERM'; throw error; }
+      if (from.includes('.previous-') && to === ${JSON.stringify(options.skillDir)}) { const error = new Error('previous restoration blocked'); error.code = 'EPERM'; throw error; }
+      return rename(from, to);
+    };`);
+  const error = await run(process.execPath, ['--import', hook, path.join(options.packageRoot, 'scripts/install.mjs'), '--data-dir', options.dataDir, '--skill-dir', options.skillDir, '--update'], { env: options.environment, timeout: 30_000 }).then(() => null, failure => failure);
+  assert.ok(error, 'the injected restore failure must reject');
+  const failedCode = /candidate is retained at (.+?)(?=;|\.\n)/.exec(error.stderr)?.[1];
+  const previous = /known-good previous code is retained at (.+?)(?=;|\.\n)/.exec(error.stderr)?.[1];
+  assert.ok(failedCode, 'error must name the quarantined candidate path');
+  assert.ok(previous, 'error must name the retained previous-code path');
+  assert.ok((await fs.stat(failedCode)).isDirectory());
+  assert.ok((await fs.stat(previous)).isDirectory());
+  await assert.rejects(fs.stat(options.skillDir), { code: 'ENOENT' });
+  await assert.rejects(fs.stat(path.join(options.dataDir, 'config.json')), { code: 'ENOENT' });
+});
+
+test('npm package symlinks escaping engine node_modules are rejected before installation', async t => {
   const options = await fixture(t); const source = path.join(options.root, 'source');
   await fs.mkdir(path.join(source, 'vendor/tool'), { recursive: true });
   await fs.writeFile(path.join(source, 'vendor/tool/package.json'), '{"name":"tool","version":"1.0.0","bin":{"fixture-tool":"cli.js"}}');
@@ -121,9 +346,31 @@ test('npm generated executable symlinks are owned and verified without allowing 
   await run('git', ['-C', source, 'commit', '-m', 'bin-fixture'], { env: options.environment });
   const commit = (await run('git', ['-C', source, 'rev-parse', 'HEAD'], { env: options.environment })).stdout.trim();
   await fs.writeFile(path.join(options.packageRoot, 'engine-lock.json'), JSON.stringify({ repository: 'https://github.com/moonlin1213/tarot-ritual.git', commit }));
-  const result = await install(options);
-  assert.equal(result.state, 'installed');
-  assert.ok((await fs.lstat(path.join(options.skillDir, 'engine/node_modules/.bin/fixture-tool'))).isSymbolicLink());
+  await assert.rejects(install(options), /unsafe symlink/i);
+  await assert.rejects(fs.stat(options.skillDir), { code: 'ENOENT' });
+});
+
+test('npm bin shims whose canonical POSIX target remains in node_modules are owned', async t => {
+  const options = await fixture(t); const source = path.join(options.root, 'source');
+  const tool = path.join(options.root, 'tool'); await fs.mkdir(tool);
+  await fs.writeFile(path.join(tool, 'package.json'), '{"name":"tool","version":"1.0.0","bin":{"fixture-tool":"cli.js"}}');
+  await fs.writeFile(path.join(tool, 'cli.js'), '#!/usr/bin/env node\n');
+  await run('npm', ['pack', '--pack-destination', source], { cwd: tool, env: options.environment });
+  await fs.writeFile(path.join(source, 'package.json'), '{"name":"fixture-engine","version":"1.0.0","dependencies":{"tool":"file:tool-1.0.0.tgz"}}');
+  await run('npm', ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: source, env: options.environment });
+  await run('git', ['-C', source, 'add', '.'], { env: options.environment });
+  await run('git', ['-C', source, 'commit', '-m', 'packed-bin-fixture'], { env: options.environment });
+  const commit = (await run('git', ['-C', source, 'rev-parse', 'HEAD'], { env: options.environment })).stdout.trim();
+  await fs.writeFile(path.join(options.packageRoot, 'engine-lock.json'), JSON.stringify({ repository: 'https://github.com/moonlin1213/tarot-ritual.git', commit }));
+  await install(options);
+  const bin = path.join(options.skillDir, 'engine', 'node_modules', '.bin', 'fixture-tool');
+  if (process.platform === 'win32') {
+    for (const extension of ['.cmd', '.ps1']) assert.ok((await fs.lstat(bin + extension)).isFile(), `${extension} must be an owned ordinary file`);
+  } else {
+    assert.ok((await fs.lstat(bin)).isSymbolicLink());
+    const target = await fs.realpath(bin);
+    assert.equal(path.relative(path.join(options.skillDir, 'engine', 'node_modules'), target).split(path.sep).includes('..'), false);
+  }
   assert.equal((await install(options)).state, 'unchanged');
 });
 

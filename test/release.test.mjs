@@ -3,9 +3,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
+import { install } from '../scripts/install.mjs';
 
 const scannerURL = new URL('../scripts/check-release.mjs', import.meta.url);
+const projectRoot = fileURLToPath(new URL('..', import.meta.url));
+const run = promisify(execFile);
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'release-synthetic-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -128,4 +133,60 @@ test('the engine lock must exist in the release index, not just as an untracked 
   const f = await fixture(t);
   f.git('rm', '--cached', 'engine-lock.json');
   assert.equal((await scan({ cwd: f.root })).ok, false);
+});
+
+test('a clean packaged install keeps native runtime files and executes its doctor command', async t => {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'release package 占卜-')));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const environment = {
+    ...process.env,
+    HOME: root,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: path.join(root, 'no-global'),
+    GIT_AUTHOR_NAME: 'Cove Contributors',
+    GIT_AUTHOR_EMAIL: 'contributors@users.noreply.github.com',
+    GIT_COMMITTER_NAME: 'Cove Contributors',
+    GIT_COMMITTER_EMAIL: 'contributors@users.noreply.github.com'
+  };
+  const engine = path.join(root, 'fixture-engine');
+  await fs.mkdir(engine);
+  await run('git', ['init', '-q', engine], { env: environment });
+  await fs.writeFile(path.join(engine, 'package.json'), '{"name":"fixture-engine","version":"1.0.0","type":"module"}');
+  await fs.writeFile(path.join(engine, 'package-lock.json'), '{"name":"fixture-engine","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"fixture-engine","version":"1.0.0"}}}');
+  await fs.writeFile(path.join(engine, 'server.mjs'), 'process.exit(0);');
+  await run('git', ['-C', engine, 'add', '.'], { env: environment });
+  await run('git', ['-C', engine, 'commit', '-qm', 'Fixture engine'], { env: environment });
+  const commit = (await run('git', ['-C', engine, 'rev-parse', 'HEAD'], { env: environment })).stdout.trim();
+
+  const packageRoot = path.join(root, 'public package');
+  await fs.mkdir(packageRoot);
+  for (const relative of ['src', 'scripts', 'public', 'agents', 'references']) {
+    await fs.cp(path.join(projectRoot, relative), path.join(packageRoot, relative), { recursive: true });
+  }
+  for (const relative of ['package.json', 'package-lock.json', 'SKILL.md', 'README.md', 'README.en.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md']) {
+    await fs.copyFile(path.join(projectRoot, relative), path.join(packageRoot, relative));
+  }
+  await fs.writeFile(path.join(packageRoot, 'engine-lock.json'), JSON.stringify({ repository: 'https://github.com/moonlin1213/tarot-ritual.git', commit }) + '\n');
+  await run('git', ['init', '-q', packageRoot], { env: environment });
+  await run('git', ['-C', packageRoot, 'add', '.'], { env: environment });
+  await run('git', ['-C', packageRoot, 'commit', '-qm', 'Public package fixture'], { env: environment });
+
+  const packageScan = await scan({ cwd: packageRoot, expectedCommit: commit });
+  assert.deepEqual(packageScan.findings, [], 'the packaged public surface must contain no host path or credential finding');
+  assert.equal(packageScan.ok, true);
+
+  Object.assign(environment, {
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: `url.${engine}.insteadOf`,
+    GIT_CONFIG_VALUE_0: 'https://github.com/moonlin1213/tarot-ritual.git'
+  });
+  const skillDir = path.join(root, 'installed skill 占卜');
+  const dataDir = path.join(root, 'private data 占卜');
+  await install({ packageRoot, skillDir, dataDir, environment });
+  for (const relative of ['scripts/companion.mjs', 'src/platform.mjs', 'README.md', 'SKILL.md', 'engine-lock.json']) {
+    assert.deepEqual(await fs.readFile(path.join(skillDir, relative)), await fs.readFile(path.join(packageRoot, relative)), relative);
+  }
+  const doctor = await run(process.execPath, [path.join(skillDir, 'scripts/companion.mjs'), 'doctor', '--help', '--data-dir', dataDir], { env: environment });
+  assert.match(doctor.stdout, /doctor \| serve \| stop-service/);
+  assert.equal(doctor.stderr, '');
 });

@@ -27,7 +27,7 @@ async function readBody(req, limit = 65536) {
  * Do not change a live installation's configured port or open its DB in a CLI.
  */
 export async function createService({ config, store: storeOrFactory, engine }) {
-  let store; let ready = false; let closing = false; let closePromise;
+  let store; let ready = false; let closing = false; let closePromise; let finalizePromise; let adminShutdownPromise; let storeClosed = false;
   const workers = new Map(); const bindings = new Map(); const streams = new Set();
   const proxies = new Set();
   const server = http.createServer((req, res) => {
@@ -111,7 +111,20 @@ export async function createService({ config, store: storeOrFactory, engine }) {
         if (command === 'claim') return json(res, store.claimDelivery(body));
         if (command === 'unknown') return json(res, store.markDeliveryUnknown(body));
         if (command === 'ack') return json(res, store.ack(body));
-        if (command === 'stop-service') { json(res, { stopped: true }); setImmediate(() => { void close(); }); return; }
+        if (command === 'stop-service') {
+          try { await stopForAdmin(); }
+          catch {
+            return json(res, {
+              stopped: false,
+              state: 'running',
+              error: 'Owned engine termination could not be verified.',
+              recovery: 'Retry stop-service. If it still fails, stop the service from its known terminal or restart the computer before installation. Never kill a process guessed from a port.',
+            }, 503);
+          }
+          res.once('finish', () => setImmediate(() => { void finalize().catch(() => {}); }));
+          json(res, { stopped: true });
+          return;
+        }
       }
       throw fail(404);
     }
@@ -282,17 +295,48 @@ export async function createService({ config, store: storeOrFactory, engine }) {
     } catch { /* deletion or a closing observer */ }
     finally { streams.delete(res); res.end(); }
   }
+  async function quiesce() {
+    const operations = [...workers.values(), ...proxies];
+    for (const operation of operations) operation.controller.abort();
+    for (const response of streams) response.end();
+    await Promise.allSettled(operations.map(operation => operation.promise));
+  }
+  async function stopForAdmin() {
+    if (adminShutdownPromise) return adminShutdownPromise;
+    closing = true;
+    const attempt = (async () => {
+      await quiesce();
+      await engine.close();
+    })();
+    adminShutdownPromise = attempt;
+    try { await attempt; }
+    catch (error) {
+      if (adminShutdownPromise === attempt) adminShutdownPromise = null;
+      closing = false;
+      throw error;
+    }
+  }
+  function finalize() {
+    finalizePromise ??= (async () => {
+      ready = false;
+      server.closeIdleConnections();
+      await new Promise((resolve, reject) => server.close(error => error && error.code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve()));
+      if (!storeClosed) { storeClosed = true; store.close(); }
+      bindings.clear();
+    })();
+    return finalizePromise;
+  }
   function close() {
     closePromise ??= (async () => {
       closing = true;
-      for (const worker of workers.values()) worker.controller.abort();
-      for (const operation of proxies) operation.controller.abort();
-      for (const res of streams) res.end();
-      await Promise.allSettled([...workers.values(), ...proxies].map(operation => operation.promise));
-      await engine.close();
-      server.closeIdleConnections();
-      await new Promise(r => server.close(r));
-      store.close(); bindings.clear();
+      let failure;
+      try {
+        await quiesce();
+        await engine.close();
+      } catch (error) { failure = error; }
+      try { await finalize(); }
+      catch (error) { failure ??= error; }
+      if (failure) throw failure;
     })();
     return closePromise;
   }

@@ -6,11 +6,26 @@ The baseline is local CLI reading, not automatic chat delivery. Use an existing 
 
 ## Binding and result data
 
-Use one stable opaque `conversation_id` per host conversation. An invitation/session belongs only to that conversation. IDs accept ASCII letters, digits, `_` and `-`, length 1–128. Never substitute display names. All commands run from the installed skill folder and accept `--data-dir DIR`.
+Use one stable opaque `conversation_id` per host conversation. An invitation/session belongs only to that conversation. IDs accept ASCII letters, digits, `_` and `-`, length 1–128. Never substitute display names. All commands run from the installed skill folder and accept `--data-dir DIR`. An adapter must retain one exact local data-directory value and pass it to every command: the default is `~/.local/share/cove-tarot-companion` on macOS/Linux and `%LOCALAPPDATA%\cove-tarot-companion` on Windows. Do not translate Windows paths through WSL or Git Bash.
 
-```sh
-node scripts/companion.mjs events --conversation conversation-example --limit 50
-node scripts/companion.mjs result --session session-example --conversation conversation-example
+macOS/Linux (Bash):
+
+```bash
+SKILL_DIR="$HOME/.agents/skills/cove-tarot-companion"
+DATA_DIR="$HOME/.local/share/cove-tarot-companion"
+cd "$SKILL_DIR"
+node scripts/companion.mjs events --conversation conversation-example --limit 50 --data-dir "$DATA_DIR"
+node scripts/companion.mjs result --session session-example --conversation conversation-example --data-dir "$DATA_DIR"
+```
+
+Windows (PowerShell):
+
+```powershell
+$SkillDir = Join-Path $env:USERPROFILE '.agents\skills\cove-tarot-companion'
+$DataDir = Join-Path $env:LOCALAPPDATA 'cove-tarot-companion'
+Set-Location $SkillDir
+node scripts/companion.mjs events --conversation conversation-example --limit 50 --data-dir $DataDir
+node scripts/companion.mjs result --session session-example --conversation conversation-example --data-dir $DataDir
 ```
 
 Events return `{events, next_cursor, has_more}`. Each event includes `event_id`, `session_id`, `conversation_id`, `revision`, `state` and `message_id`. Follow the cursor while `has_more`; retaining the final cursor polls newly inserted events. To reconcile state changes of already known events, begin a fresh traversal without a cursor. A cursor is position metadata, not authorization or permission to re-deliver.
@@ -33,7 +48,7 @@ The connector deduplicates repeated returns at one revision. It does not inspect
 
 ## Lifecycle and failures
 
-`doctor` checks installation/service without starting a process. `invite`, `events` and other operational commands lazily start this installation's authenticated loopback service. The original engine starts only after acceptance when needed. `stop-service` stops the owned connector and child; it never kills arbitrary port occupants. A hard-killed connector may leave an authenticated engine orphan: a new connector can reuse it but cannot terminate a child handle it never owned. Do not use kill-by-port recovery.
+`doctor` checks installation/service without starting a process. `invite`, `events` and other operational commands lazily start this installation's authenticated loopback service. The original engine starts only after acceptance when needed. `stop-service` returns `stopped: true` only after its owned engine child is confirmed terminated; an unverifiable exit returns a bounded error while the connector remains available for a retry. Do not update or uninstall after that error. A hard-killed connector may leave an authenticated engine orphan: a new connector can reuse it but cannot terminate a child handle it never owned. Stop a failed connector from its known terminal or restart the computer; never use kill-by-port recovery.
 
 Refresh restores saved cards, orientations, reveal state and reading without a new paid request. Reopening the same invitation after a service restart restores authorization; cookies are not durable across service restarts. A running reading is observed by GET. Interrupted reading status can be unknown with partial text; new paid work requires deliberate user action. Returned/stopped/deleted sessions cannot invoke original provider/photo proxy work.
 

@@ -3,9 +3,30 @@ on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 jobs:
-  original-ui:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  native-desktop:
+    name: Native ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-latest
+            platform: linux
+            arch: x64
+          - name: Windows x64
+            runner: windows-latest
+            platform: win32
+            arch: x64
+          - name: macOS Intel x64
+            runner: macos-15-intel
+            platform: darwin
+            arch: x64
+          - name: macOS Apple Silicon arm64
+            runner: macos-15
+            platform: darwin
+            arch: arm64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -15,18 +36,47 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      - name: Assert native runner architecture
+        run: node -e "if(process.platform!==process.env.EXPECTED_PLATFORM||process.arch!==process.env.EXPECTED_ARCH)process.exit(1)"
+        env:
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Audit complete public history and tracked content
+        if: runner.os == 'Linux'
         run: node scripts/check-release.mjs
-      - name: Install exact public engine through the user installer
-        run: node scripts/install.mjs --skill-dir "$RUNNER_TEMP/companion-skill" --data-dir "$RUNNER_TEMP/companion-data"
-      - name: Regression with actual engine
+      - name: Install exact public engine through the user installer (Bash)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          skill_dir="$RUNNER_TEMP/companion-skill"
+          data_dir="$RUNNER_TEMP/companion-data"
+          node scripts/install.mjs --skill-dir "$skill_dir" --data-dir "$data_dir"
+      - name: Install exact public engine through the user installer (PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $skillDir = Join-Path $env:RUNNER_TEMP 'companion-skill'
+          $dataDir = Join-Path $env:RUNNER_TEMP 'companion-data'
+          node scripts/install.mjs --skill-dir $skillDir --data-dir $dataDir
+      - name: Full regression with actual installed engine
         run: npm test
         env:
           TAROT_TEST_ENGINE_ROOT: ${{ runner.temp }}/companion-skill/engine
       - name: Install isolated browser test dependency
         run: npm install --no-save --package-lock=false --ignore-scripts playwright@1.62.1
-      - run: npx playwright install --with-deps chromium webkit
+      - name: Install Chromium and WebKit with Linux system dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: npx playwright install --with-deps chromium webkit
+      - name: Install Chromium and WebKit on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: npx playwright install chromium webkit
+      - name: Install Chromium and WebKit on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: npx playwright install chromium webkit
       - name: Real Chromium and WebKit original UI gates
         run: node --test test/browser.test.mjs
         env:

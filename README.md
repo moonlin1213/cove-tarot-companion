@@ -6,21 +6,59 @@
 
 ## 安装完整包
 
-需要 **Node 24.5+、npm、Git、安装时的网络连接，以及支持 WebGL2 的本机桌面浏览器**。Agent 须已有同一电脑上的命令/浏览器能力；纯云端 agent 不能直接打开你电脑的 loopback 地址。安装器不会安装系统运行时或修改全局代理。
+需要 **Node 24.5+、npm、Git、安装时的网络连接，以及支持 WebGL2 的本机桌面浏览器**。Agent 须已有同一电脑上的命令/浏览器能力；纯云端 agent 不能直接打开你电脑的 loopback 地址。安装器不会安装系统运行时、Git 或浏览器，也不会修改全局代理。
 
-下面是 POSIX shell 示例，使用常见的 `.agents/skills` 发现目录；若宿主约定不同，请改为其技能目录。
+当前发布门禁覆盖 Windows 10/11 x64、macOS Intel x64、macOS Apple Silicon arm64 和 Linux x64。Windows 直接使用系统 PowerShell，**不需要 WSL 或 Git Bash**；也不需要 Docker、Python、全局 npm 包或需本地编译的 npm 扩展。以下命令使用常见的 `.agents/skills` 发现目录；若宿主约定不同，只替换 `SkillDir`。
 
-```sh
-git clone https://github.com/moonlin1213/cove-tarot-companion.git
-cd cove-tarot-companion
-node scripts/install.mjs --skill-dir "$HOME/.agents/skills/cove-tarot-companion"
-cd "$HOME/.agents/skills/cove-tarot-companion"
-node scripts/companion.mjs doctor
+### macOS / Linux（Bash）
+
+安装：
+
+```bash
+SOURCE_DIR="$HOME/cove-tarot-companion"
+SKILL_DIR="$HOME/.agents/skills/cove-tarot-companion"
+DATA_DIR="$HOME/.local/share/cove-tarot-companion"
+git clone https://github.com/moonlin1213/cove-tarot-companion.git "$SOURCE_DIR"
+cd "$SOURCE_DIR"
+node scripts/install.mjs --skill-dir "$SKILL_DIR" --data-dir "$DATA_DIR"
+```
+
+诊断：
+
+```bash
+SKILL_DIR="$HOME/.agents/skills/cove-tarot-companion"
+DATA_DIR="$HOME/.local/share/cove-tarot-companion"
+cd "$SKILL_DIR"
+node scripts/companion.mjs doctor --data-dir "$DATA_DIR"
+```
+
+### Windows 10/11 x64（PowerShell）
+
+安装：
+
+```powershell
+$SourceDir = Join-Path $env:USERPROFILE 'cove-tarot-companion'
+$SkillDir = Join-Path $env:USERPROFILE '.agents\skills\cove-tarot-companion'
+$DataDir = Join-Path $env:LOCALAPPDATA 'cove-tarot-companion'
+git clone https://github.com/moonlin1213/cove-tarot-companion.git $SourceDir
+Set-Location $SourceDir
+node scripts/install.mjs --skill-dir $SkillDir --data-dir $DataDir
+```
+
+诊断：
+
+```powershell
+$SkillDir = Join-Path $env:USERPROFILE '.agents\skills\cove-tarot-companion'
+$DataDir = Join-Path $env:LOCALAPPDATA 'cove-tarot-companion'
+Set-Location $SkillDir
+node scripts/companion.mjs doctor --data-dir $DataDir
 ```
 
 **只复制 SKILL.md 不等于完成安装。** 配套安装器会复制 Skill/连接程序、取得 `engine-lock.json` 指定的公开 commit、核对实际 Git HEAD，并运行引擎锁定依赖的 `npm ci --ignore-scripts`。不会跟随浮动分支自动更新、从私人目录补文件、导入账号或请求模型。固定版本无法取得时明确失败，保留原安装。通用 Skill 复制工具仍需完成本包的安装步骤。
 
-私有配置与状态默认存于操作系统用户目录下的 `.local/share/cove-tarot-companion`。也可安装时指定 `--data-dir /chosen/private-data`，此后**每条 CLI 命令都使用同一参数**。代码和数据目录必须分开。随机凭据仅存于仅本人可读的文件，不进入 URL 或聊天。默认端口为 18642/18643；不接管无关占用，也不支持运行中迁移配置/端口。
+私有配置与状态的默认位置因平台而异：macOS/Linux 为 `~/.local/share/cove-tarot-companion`，Windows 为 `%LOCALAPPDATA%\cove-tarot-companion`。也可安装时指定本机私有的 `--data-dir`，此后**每条 CLI 命令都使用同一参数**。Windows 若无法解析 `LOCALAPPDATA`，安装会明确失败，不会猜测公共目录。私有数据必须位于可验证本机锁与原子替换语义的文件系统；网络、设备、FUSE 类及无法识别的卷均明确拒绝。源码、安装代码和数据目录必须彼此分开。随机凭据仅存于已验证的本人私有文件，不进入 URL 或聊天。默认端口为 18642/18643；不接管无关占用，也不支持运行中迁移配置/端口。
+
+本次发布合同不包含 Windows ARM、UNC/网络或其他无法验证私有权限与原子替换的数据目录、GUI 安装器、移动平台、系统级自动更新或默认开机常驻。Windows ARM 在纯 Node.js 能力恰好可用时可能运行，但不属于支持声明或发布验收。
 
 ## 首次使用与自己的模型服务
 
@@ -51,24 +89,69 @@ node scripts/companion.mjs result --session SESSION_ID --conversation example-co
 
 ## 停止、更新与卸载
 
-```sh
-node scripts/companion.mjs stop-service
-# 离开已安装目录，换成你另行下载并审查的发行源码路径：
-cd /chosen/reviewed-release/cove-tarot-companion
-node scripts/install.mjs --skill-dir "$HOME/.agents/skills/cove-tarot-companion" --update
-# 或仅卸载自有代码，保留数据与可恢复副本：
-node scripts/install.mjs --skill-dir "$HOME/.agents/skills/cove-tarot-companion" --uninstall
+下列更新命令会快进到公开源码的最新版本；在执行安装器前先审查拉取到的 commit 和差异。
+
+macOS/Linux 更新（Bash）：
+
+```bash
+SOURCE_DIR="$HOME/cove-tarot-companion"
+SKILL_DIR="$HOME/.agents/skills/cove-tarot-companion"
+DATA_DIR="$HOME/.local/share/cove-tarot-companion"
+cd "$SKILL_DIR"
+node scripts/companion.mjs stop-service --data-dir "$DATA_DIR"
+git -C "$SOURCE_DIR" pull --ff-only
+cd "$SOURCE_DIR"
+node scripts/install.mjs --skill-dir "$SKILL_DIR" --data-dir "$DATA_DIR" --update
+```
+
+Windows 更新（PowerShell）：
+
+```powershell
+$SourceDir = Join-Path $env:USERPROFILE 'cove-tarot-companion'
+$SkillDir = Join-Path $env:USERPROFILE '.agents\skills\cove-tarot-companion'
+$DataDir = Join-Path $env:LOCALAPPDATA 'cove-tarot-companion'
+Set-Location $SkillDir
+node scripts/companion.mjs stop-service --data-dir $DataDir
+git -C $SourceDir pull --ff-only
+Set-Location $SourceDir
+node scripts/install.mjs --skill-dir $SkillDir --data-dir $DataDir --update
+```
+
+macOS/Linux 卸载（Bash）：
+
+```bash
+SOURCE_DIR="$HOME/cove-tarot-companion"
+SKILL_DIR="$HOME/.agents/skills/cove-tarot-companion"
+DATA_DIR="$HOME/.local/share/cove-tarot-companion"
+cd "$SKILL_DIR"
+node scripts/companion.mjs stop-service --data-dir "$DATA_DIR"
+cd "$SOURCE_DIR"
+node scripts/install.mjs --skill-dir "$SKILL_DIR" --data-dir "$DATA_DIR" --uninstall
+```
+
+Windows 卸载（PowerShell）：
+
+```powershell
+$SourceDir = Join-Path $env:USERPROFILE 'cove-tarot-companion'
+$SkillDir = Join-Path $env:USERPROFILE '.agents\skills\cove-tarot-companion'
+$DataDir = Join-Path $env:LOCALAPPDATA 'cove-tarot-companion'
+Set-Location $SkillDir
+node scripts/companion.mjs stop-service --data-dir $DataDir
+Set-Location $SourceDir
+node scripts/install.mjs --skill-dir $SkillDir --data-dir $DataDir --uninstall
 ```
 
 更新请从新下载并审查的发行包运行，先停止本安装的服务。无修改重复安装幂等；更新保留前版副本，失败不丢原状态。用户修改的代码、牌面及其他新增文件受保护，不会被覆盖；卸载发现修改会保留，未修改代码移动至可恢复的相邻目录。配置/数据不删除，清理另行确认。崩溃遗留安装锁会拒绝继续，应先检查再手动恢复。
 
 下次操作命令按需启动本安装的服务，无默认开机常驻项。正常停止只关闭自有子进程。若连接器被强行杀掉，可能留下可鉴权复用的引擎孤儿进程；新连接器不能用从未持有的子进程句柄停止它，更不会按端口杀无关程序。
 
+`stop-service` 只有在确认自有引擎子进程已经退出后才返回 `stopped: true`。若无法验证终止，它会返回有长度上限的错误，并让连接器继续可用，以便再次执行停止；此时不要更新或卸载。先重试一次，若仍失败，请从已知的原终端停止连接器，或保存工作、重启电脑后再重试安装。
+
 正常停止会取消并等待进行中的引擎启动及代理请求。更新或卸载前，引擎端口必须空闲；即使遗留引擎仍可鉴权，安装器也会在切换代码前拒绝，避免新版文件混用旧进程。请通过已知的原所属程序或终端停止它；若崩溃后已无可信所属句柄，保存工作并重启电脑，然后在再次启动连接程序前重试安装操作。不要根据端口猜测并终止进程。未改变版本的无操作重复安装不受此限制。
 
 ## 验证范围
 
-`npm test` 运行回归测试。真实浏览器验收必须显式开启；跳过不能算通过。CI 通过本包安装器取得固定引擎，使用 Chromium/WebKit 原 UI 与本机假上游，覆盖原设置手动配置、抽牌/整组翻牌、刷新、返回及假宿主真实持久化消息后 ACK。没有实测付费供应商、个人 DSH 账号、任意宿主品牌、手机浏览器或 Windows，不能据此声称通用兼容。
+`npm test` 运行回归测试。真实浏览器验收必须显式开启；跳过不能算通过。CI 在 Linux x64、Windows x64、macOS Intel x64 和 macOS Apple Silicon arm64 原生 runner 上断言平台/架构，通过本包安装器取得固定引擎，再使用 Chromium/WebKit 原 UI 与本机假上游，覆盖原设置手动配置、抽牌/整组翻牌、刷新、返回及假宿主真实持久化消息后 ACK。没有实测付费供应商、个人 DSH 账号、任意宿主品牌或手机浏览器，不能据此声称这些组合通用兼容。
 
 ```sh
 # 验证须在源码 checkout 运行（已安装技能不包含 test/ 和 .git）：

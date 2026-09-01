@@ -3,13 +3,14 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { loadConfig, defaultDataDir } from '../src/config.mjs';
 import { Engine } from '../src/engine.mjs';
 import { createService } from '../src/server.mjs';
+import { applyPrivateUmask, assertPrivateDatabaseFiles, securePrivateFile, spawnOwned } from '../src/platform.mjs';
 
 const BASE = '/companion/v1';
 const pause = ms => new Promise(r => setTimeout(r, ms));
+const SHUTDOWN_RECOVERY = 'Local shutdown was not verified because owned engine termination could not be confirmed. Retry stop-service. If it still fails, stop the service from its known terminal or restart the computer before installation. Never kill a process guessed from a port.';
 export async function probeService(config) {
   let response;
   try { response = await fetch(config.origin + BASE + '/health', { headers: { authorization: `Bearer ${config.adminToken}` }, signal: AbortSignal.timeout(1500), redirect: 'error' }); }
@@ -30,15 +31,17 @@ export async function probeService(config) {
     return health;
   } catch { throw new Error('Local service identity does not match this installation'); }
 }
-async function ensureService(config) {
-  if (await probeService(config)) return;
+export async function ensureService(config, { platform = process.platform, probe = probeService, spawnImplementation } = {}) {
+  if (await probe(config)) return;
   // Competing children race only for the fixed socket. Losing children never
   // construct Store and cannot perform recovery over the winner's live work.
-  const child = spawn(config.executable, [fileURLToPath(import.meta.url), 'serve', '--data-dir', config.dataDir], { detached: true, stdio: 'ignore', env: process.env });
+  const child = spawnOwned(config.executable, [fileURLToPath(import.meta.url), 'serve', '--data-dir', config.dataDir], {
+    detached: true, stdio: 'ignore', env: process.env, platform, spawnImplementation,
+  });
   let failed = false; child.once('error', () => { failed = true; }); child.unref();
   for (let i = 0; i < 100 && !failed; i++) {
     await pause(50);
-    try { if (await probeService(config)) return; }
+    try { if (await probe(config)) return; }
     catch (error) { if (i > 10) throw error; }
   }
   throw new Error('Local service could not start; run serve to inspect the configuration');
@@ -49,6 +52,7 @@ async function call(config, route, body) {
   }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(10000), redirect: 'error' });
   if (!response.ok) {
     await response.body?.cancel();
+    if (route === '/stop-service' && response.status === 503) throw new Error(SHUTDOWN_RECOVERY);
     throw new Error(`Local request rejected (${response.status}); check conversation, consent and state`);
   }
   const chunks = []; let bytes = 0;
@@ -58,6 +62,15 @@ async function call(config, route, body) {
     chunks.push(chunk);
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+export function registerShutdownSignals(service, { processObject = process } = {}) {
+  const shutdown = () => {
+    void Promise.resolve().then(() => service.close()).catch(() => {
+      processObject.stderr.write(SHUTDOWN_RECOVERY + '\n');
+      processObject.exitCode = 1;
+    });
+  };
+  for (const signal of ['SIGINT', 'SIGTERM']) processObject.once(signal, shutdown);
 }
 export function parseArguments(args) {
   const options = {}; const positional = [];
@@ -86,7 +99,7 @@ Credentials remain in the private data directory, never URLs or CLI output.`;
   if (Object.keys(options).some(key => !['data-dir', 'conversation', 'manual', 'request', 'session', 'event', 'message', 'cursor', 'limit'].includes(key))) throw new Error('Unknown option');
   const config = await loadConfig(options['data-dir'] || defaultDataDir());
   if (command === 'serve') {
-    process.umask(0o077);
+    applyPrivateUmask();
     const engine = new Engine({ root: config.engineRoot, executable: config.executable, port: config.enginePort, token: config.engineToken });
     const service = await createService({ config, engine, store: async () => {
       // Called only after acquiring the fixed-port owner lock.
@@ -94,16 +107,22 @@ Credentials remain in the private data directory, never URLs or CLI output.`;
         await fs.lstat(path.join(config.dataDir, '.install.lock'));
         throw new Error('Installation in progress; install lock prevents service startup');
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
-      for (const suffix of ['', '-wal', '-shm']) {
-        try {
-          const stat = await fs.lstat(path.join(config.dataDir, 'state.sqlite' + suffix));
-          if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) || (process.getuid && stat.uid !== process.getuid())) throw new Error('Unsafe database file');
-        } catch (error) { if (error.code !== 'ENOENT') throw error; }
-      }
+      await assertPrivateDatabaseFiles(config.dataDir);
       const { Store } = await import('../src/store.mjs');
-      return new Store(path.join(config.dataDir, 'state.sqlite'));
+      const store = new Store(path.join(config.dataDir, 'state.sqlite'));
+      try {
+        for (const suffix of ['', '-wal', '-shm']) {
+          try { await securePrivateFile(path.join(config.dataDir, 'state.sqlite' + suffix)); }
+          catch (error) { if (error?.code !== 'ENOENT') throw error; }
+        }
+        await assertPrivateDatabaseFiles(config.dataDir);
+        return store;
+      } catch (error) {
+        store.close();
+        throw error;
+      }
     } });
-    for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { void service.close(); });
+    registerShutdownSignals(service);
     return { service: 'running', origin: service.origin };
   }
   if (command === 'doctor') {
