@@ -3,11 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile as execFileCallback } from 'node:child_process';
-import { promisify } from 'node:util';
 import { assertLocalPath, assertManagedDestination, assertPrivateFile, defaultPrivateDataDir, ensurePrivateDirectory, pathsOverlap, readPrivateFile, removeWithRetry, renameWithRetry, runExternal, runNpmCi, securePrivateFile } from '../src/platform.mjs';
+import { runWindowsPowerShell } from './windows-powershell.mjs';
 
-const execFile = promisify(execFileCallback);
 const linuxFixtureHome = path.posix.join(path.posix.sep, 'home', 'fixture');
 const macOSFixtureHome = path.posix.join(path.posix.sep, 'Users', 'fixture');
 const windowsFixtureHome = path.win32.join('C:' + path.win32.sep, 'Users', 'Fixture');
@@ -31,6 +29,76 @@ test('local path assertions reject Windows network and device namespaces lexical
     await assert.rejects(async () => assertLocalPath(candidate, { platform: 'win32' }), /local|network|device/i);
   }
   await assert.doesNotReject(async () => assertLocalPath(path.win32.join(windowsFixtureLocalAppData, 'cove'), { platform: 'win32' }));
+});
+
+test('Windows ACL diagnostics expose only fixed stage and reason codes', async () => {
+  const platform = await import('../src/platform.mjs');
+  assert.equal(typeof platform.windowsAclFailure, 'function', 'the ACL boundary must provide a fixed diagnostic mapper');
+  const privateDetail = 'synthetic-private-acl-detail';
+  const directory = platform.windowsAclFailure(`${privateDetail}\nCOVE_TAROT_ACL_DIRECTORY_RULE_COUNT`);
+  assert.equal(directory.message, 'Private storage ACL or owner is unsafe (ACL_DIRECTORY_RULE_COUNT)');
+  assert.doesNotMatch(directory.message, new RegExp(privateDetail));
+  const operation = platform.windowsAclFailure(`${privateDetail}\nCOVE_TAROT_ACL_DIRECTORY_UNEXPECTED_ACL_WRITE`);
+  assert.equal(operation.message, 'Private storage ACL or owner is unsafe (ACL_DIRECTORY_UNEXPECTED_ACL_WRITE)');
+  assert.doesNotMatch(operation.message, new RegExp(privateDetail));
+  const exceptionClass = platform.windowsAclFailure(`${privateDetail}\nCOVE_TAROT_ACL_DIRECTORY_UNEXPECTED_ACL_READ_NOT_SUPPORTED`);
+  assert.equal(exceptionClass.message, 'Private storage ACL or owner is unsafe (ACL_DIRECTORY_UNEXPECTED_ACL_READ_NOT_SUPPORTED)');
+  assert.doesNotMatch(exceptionClass.message, new RegExp(privateDetail));
+  const file = platform.windowsAclFailure(`COVE_TAROT_ACL_FILE_VALIDATE_OWNER\n${privateDetail}`);
+  assert.equal(file.message, 'Private storage ACL or owner is unsafe (ACL_FILE_VALIDATE_OWNER)');
+  const unknown = platform.windowsAclFailure(privateDetail);
+  assert.equal(unknown.message, 'Private storage ACL could not be secured or verified');
+  assert.doesNotMatch(unknown.message, new RegExp(privateDetail));
+});
+
+test('Windows ACL host selection falls back only when an executable is absent', async t => {
+  const platform = await import('../src/platform.mjs');
+  assert.equal(typeof platform.runWindowsAcl, 'function', 'the ACL boundary must expose an injectable host selector');
+  const target = path.win32.join(windowsFixtureLocalAppData, 'cove-tarot-companion');
+  const missingHost = () => Object.assign(new Error('host absent'), { code: 'ENOENT' });
+
+  await t.test('prefers pwsh and preserves static argument and environment passing', async () => {
+    const calls = [];
+    await platform.runWindowsAcl(target, 'secure-directory', { execute: async (host, args, options) => {
+      calls.push(host);
+      assert.equal(args.at(-1).includes(target), false);
+      assert.equal(options.env.COVE_TAROT_ACL_PATH, target);
+      assert.equal(options.env.COVE_TAROT_ACL_ACTION, 'secure-directory');
+      assert.equal(options.shell, false);
+    } });
+    assert.deepEqual(calls, ['pwsh.exe']);
+  });
+
+  await t.test('uses Windows PowerShell only after pwsh ENOENT', async () => {
+    const calls = [];
+    await platform.runWindowsAcl(target, 'inspect', { execute: async host => {
+      calls.push(host);
+      if (host === 'pwsh.exe') throw missingHost();
+    } });
+    assert.deepEqual(calls, ['pwsh.exe', 'powershell.exe']);
+  });
+
+  await t.test('does not fallback after a pwsh command or ACL failure', async () => {
+    const calls = [];
+    const failure = Object.assign(new Error('fixed failure'), {
+      code: 1,
+      stderr: 'COVE_TAROT_ACL_DIRECTORY_UNEXPECTED_ACL_READ_COMMAND_MISSING',
+    });
+    await assert.rejects(platform.runWindowsAcl(target, 'secure-directory', { execute: async host => {
+      calls.push(host);
+      throw failure;
+    } }), /ACL_DIRECTORY_UNEXPECTED_ACL_READ_COMMAND_MISSING/);
+    assert.deepEqual(calls, ['pwsh.exe']);
+  });
+
+  await t.test('reports a fixed prerequisite error when both hosts are absent', async () => {
+    const calls = [];
+    await assert.rejects(platform.runWindowsAcl(target, 'inspect', { execute: async host => {
+      calls.push(host);
+      throw missingHost();
+    } }), { message: 'PowerShell 7 or Windows PowerShell is required to verify Windows private storage' });
+    assert.deepEqual(calls, ['pwsh.exe', 'powershell.exe']);
+  });
 });
 
 test('POSIX local-storage classification rejects remote, device and unknown filesystem semantics', async () => {
@@ -171,25 +239,25 @@ test(`private storage rejects broad files and links on ${process.platform}`, asy
 
   if (process.platform === 'win32') {
     const program = "$p=$env:COVE_TAROT_ACL_PATH;$acl=Get-Acl -LiteralPath $p;$sid=New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545');$rule=New-Object Security.AccessControl.FileSystemAccessRule($sid,'Read','Allow');$acl.AddAccessRule($rule);Set-Acl -LiteralPath $p -AclObject $acl";
-    await execFile('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', program], { env: { ...process.env, COVE_TAROT_ACL_PATH: filename } });
+    await runWindowsPowerShell(program, { ...process.env, COVE_TAROT_ACL_PATH: filename });
     await assert.rejects(assertPrivateFile(filename), /ACL|owner|unsafe/i);
 
     const ownedByOther = path.join(directory, 'foreign-owner');
     await fs.writeFile(ownedByOther, 'synthetic owner test', { mode: 0o600 });
     await securePrivateFile(ownedByOther);
     const replaceOwner = "$p=$env:COVE_TAROT_ACL_PATH;$acl=Get-Acl -LiteralPath $p;$acl.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')));Set-Acl -LiteralPath $p -AclObject $acl";
-    await execFile('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', replaceOwner], { env: { ...process.env, COVE_TAROT_ACL_PATH: ownedByOther } });
+    await runWindowsPowerShell(replaceOwner, { ...process.env, COVE_TAROT_ACL_PATH: ownedByOther });
     await assert.rejects(assertPrivateFile(ownedByOther), /ACL|owner|unsafe/i);
 
     const unreadable = path.join(root, 'unreadable-ancestor');
     await fs.mkdir(unreadable);
     const denyAttributes = "$p=$env:COVE_TAROT_ACL_PATH;$acl=Get-Acl -LiteralPath $p;$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$rule=New-Object Security.AccessControl.FileSystemAccessRule($sid,[Security.AccessControl.FileSystemRights]::ReadAttributes,[Security.AccessControl.AccessControlType]::Deny);$acl.AddAccessRule($rule);Set-Acl -LiteralPath $p -AclObject $acl";
     const restoreAttributes = "$p=$env:COVE_TAROT_ACL_PATH;$acl=Get-Acl -LiteralPath $p;$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User;$rule=New-Object Security.AccessControl.FileSystemAccessRule($sid,[Security.AccessControl.FileSystemRights]::ReadAttributes,[Security.AccessControl.AccessControlType]::Deny);$acl.RemoveAccessRuleAll($rule);Set-Acl -LiteralPath $p -AclObject $acl";
-    await execFile('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', denyAttributes], { env: { ...process.env, COVE_TAROT_ACL_PATH: unreadable } });
+    await runWindowsPowerShell(denyAttributes, { ...process.env, COVE_TAROT_ACL_PATH: unreadable });
     try {
       await assert.rejects(ensurePrivateDirectory(path.join(unreadable, 'child')), /inspect|reparse/i);
     } finally {
-      await execFile('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', restoreAttributes], { env: { ...process.env, COVE_TAROT_ACL_PATH: unreadable } });
+      await runWindowsPowerShell(restoreAttributes, { ...process.env, COVE_TAROT_ACL_PATH: unreadable });
     }
   } else {
     await fs.chmod(filename, 0o644);

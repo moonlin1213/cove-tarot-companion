@@ -15,6 +15,7 @@ jobs:
             runner: ubuntu-latest
             platform: linux
             arch: x64
+            browsers: chromium,webkit
           - name: Windows x64
             runner: windows-latest
             platform: win32
@@ -23,10 +24,12 @@ jobs:
             runner: macos-15-intel
             platform: darwin
             arch: x64
+            browsers: chromium
           - name: macOS Apple Silicon arm64
             runner: macos-15
             platform: darwin
             arch: arm64
+            browsers: chromium,webkit
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,11 +62,44 @@ jobs:
           $skillDir = Join-Path $env:RUNNER_TEMP 'companion-skill'
           $dataDir = Join-Path $env:RUNNER_TEMP 'companion-data'
           node scripts/install.mjs --skill-dir $skillDir --data-dir $dataDir
+      - name: Windows installed providerless lifecycle smoke
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $skillDir = Join-Path $env:RUNNER_TEMP 'companion-skill'
+          $dataDir = Join-Path $env:RUNNER_TEMP 'companion-data'
+          $companion = Join-Path $skillDir 'scripts/companion.mjs'
+          function Invoke-CompanionJson {
+            param([string[]]$CommandArgs)
+            $output = & node $companion @CommandArgs '--data-dir' $dataDir
+            if ($LASTEXITCODE -ne 0) { throw 'Installed lifecycle command failed' }
+            try { $result = $output | ConvertFrom-Json -ErrorAction Stop }
+            catch { throw 'Installed lifecycle output was invalid' }
+            return $result
+          }
+          try {
+            $doctor = Invoke-CompanionJson -CommandArgs @('doctor')
+            if ($doctor.service -ne 'stopped' -or $doctor.engineInstalled -ne $true) { throw 'Installed doctor state was invalid' }
+            $invite = Invoke-CompanionJson -CommandArgs @('invite', '--conversation', 'native-providerless-smoke', '--manual')
+            if ($invite.state -ne 'pending' -or $invite.conversation_id -ne 'native-providerless-smoke') { throw 'Installed invitation state was invalid' }
+          } finally {
+            $stopped = Invoke-CompanionJson -CommandArgs @('stop-service')
+            if ($stopped.stopped -ne $true) { throw 'Installed service did not stop' }
+          }
+      - name: Windows fail-closed boundary regressions
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        shell: pwsh
+        run: node --test --test-concurrency=1 --test-name-pattern 'Windows ACL host selection falls back only when an executable is absent|Windows service startup waits thirty seconds for its authenticated initializing owner|service readiness exhaustion is bounded at thirty seconds on Windows and five elsewhere|Windows replacement retries transient sharing failures exactly three times|replacement refuses to retry access and identity failures' test/platform.test.mjs test/cli.test.mjs
       - name: Full regression with actual installed engine
+        if: runner.os != 'Windows'
         run: npm test
         env:
           TAROT_TEST_ENGINE_ROOT: ${{ runner.temp }}/companion-skill/engine
       - name: Install isolated browser test dependency
+        if: runner.os != 'Windows'
         run: npm install --no-save --package-lock=false --ignore-scripts playwright@1.62.1
       - name: Install Chromium and WebKit with Linux system dependencies
         if: runner.os == 'Linux'
@@ -73,12 +109,10 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: npx playwright install chromium webkit
-      - name: Install Chromium and WebKit on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: npx playwright install chromium webkit
-      - name: Real Chromium and WebKit original UI gates
+      - name: Selected real browser original UI gates
+        if: runner.os != 'Windows'
         run: node --test test/browser.test.mjs
         env:
           TAROT_TEST_BROWSER: '1'
+          TAROT_TEST_BROWSERS: ${{ matrix.browsers }}
           TAROT_TEST_ENGINE_ROOT: ${{ runner.temp }}/companion-skill/engine

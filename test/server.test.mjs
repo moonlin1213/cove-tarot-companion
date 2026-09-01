@@ -395,12 +395,37 @@ test('service restart preserves accepted completed records and uncertain host cl
   assert.equal((await f.admin('ack', { ...ref, message_id: 'actual-persisted-message' })).status, 200);
 });
 
-test('failed service initialization releases the exclusive socket before any replacement owner', async t => {
+test('failed service initialization reports authenticated readiness, releases the socket and permits retry', async t => {
   const f = await fixture(t);
   await f.service.close();
-  await assert.rejects(createService({ config: { servicePort: Number(new URL(f.origin).port) }, engine: {}, store: () => { throw new Error('synthetic initializer failure'); } }), /initializer/);
+  let enteredResolve; const entered = new Promise(resolve => { enteredResolve = resolve; });
+  let releaseResolve; const release = new Promise(resolve => { releaseResolve = resolve; });
+  const failed = createService({ config: {
+    servicePort: Number(new URL(f.origin).port),
+    adminToken: 'synthetic-admin-secret',
+    installationId: 'synthetic-installation',
+  }, engine: {}, store: async () => {
+    enteredResolve(); await release; throw new Error('synthetic initializer failure');
+  } });
+  const rejected = assert.rejects(failed, /initializer/);
+  await entered;
+  let startingStatus; let startingHealth;
+  try {
+    const starting = await f.admin('health');
+    startingStatus = starting.status;
+    startingHealth = await starting.json();
+  } finally {
+    releaseResolve(); await rejected;
+  }
   await f.restart();
-  assert.equal((await f.admin('health')).status, 200);
+  const running = await f.admin('health');
+  const runningStatus = running.status;
+  const runningHealth = await running.json();
+  assert.equal(startingStatus, 200);
+  assert.equal(startingHealth.installation_id, 'synthetic-installation');
+  assert.equal(startingHealth.ready, false);
+  assert.equal(runningStatus, 200);
+  assert.equal(runningHealth.ready, true);
 });
 
 test('installed original engine imports its canonical prompt builder and streams a synthetic custom provider', { skip: !process.env.TAROT_TEST_ENGINE_ROOT }, async t => {

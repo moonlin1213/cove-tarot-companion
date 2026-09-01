@@ -28,6 +28,7 @@ async function readBody(req, limit = 65536) {
  */
 export async function createService({ config, store: storeOrFactory, engine }) {
   let store; let ready = false; let closing = false; let closePromise; let finalizePromise; let adminShutdownPromise; let storeClosed = false;
+  let origin;
   const workers = new Map(); const bindings = new Map(); const streams = new Set();
   const proxies = new Set();
   const server = http.createServer((req, res) => {
@@ -39,14 +40,15 @@ export async function createService({ config, store: storeOrFactory, engine }) {
   });
   server.requestTimeout = 30000; server.headersTimeout = 10000; server.maxHeadersCount = 64;
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.servicePort, '127.0.0.1', resolve); });
-  const origin = `http://127.0.0.1:${server.address().port}`;
+  origin = `http://127.0.0.1:${server.address().port}`;
   try { store = typeof storeOrFactory === 'function' ? await storeOrFactory() : storeOrFactory; ready = true; }
   catch (error) { await new Promise(r => server.close(r)); throw error; }
   const service = { server, origin, close };
   return service;
 
-  function guard(req) {
-    if (!ready || closing) throw fail(503);
+  function guard(req, { allowInitializing = false } = {}) {
+    if ((!ready || closing) && !allowInitializing) throw fail(503);
+    if (!origin) throw fail(503);
     if (req.headers.host !== new URL(origin).host || (req.headers.origin && req.headers.origin !== origin)) throw fail(403);
     if (req.headers['sec-fetch-site'] && !['same-origin', 'none'].includes(req.headers['sec-fetch-site'])) throw fail(403);
     if (!req.url.startsWith('/') || req.url.startsWith('//') || req.url.includes('#')) throw fail(400);
@@ -87,7 +89,8 @@ export async function createService({ config, store: storeOrFactory, engine }) {
     res.setHeader('referrer-policy', 'no-referrer'); res.setHeader('x-frame-options', 'DENY');
     res.setHeader('cross-origin-resource-policy', 'same-origin');
     res.setHeader('content-security-policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'");
-    guard(req);
+    const initializingHealth = req.method === 'GET' && req.url === `${BASE}/health`;
+    guard(req, { allowInitializing: initializingHealth });
     let url; let pathname;
     try { url = new URL(req.url, origin); pathname = decodeURIComponent(url.pathname); } catch { throw fail(400); }
     if (pathname.split('/').some(part => part.startsWith('.')) || pathname.includes('\\') || pathname.includes('\0')) throw fail(404);
@@ -95,7 +98,7 @@ export async function createService({ config, store: storeOrFactory, engine }) {
       admin(req);
       const command = pathname.slice(`${BASE}/`.length);
       if (req.method === 'GET') {
-        if (command === 'health') return json(res, { protocol: 'cove-tarot-companion-v1', installation_id: config.installationId, pid: process.pid });
+        if (command === 'health') return json(res, { protocol: 'cove-tarot-companion-v1', installation_id: config.installationId, pid: process.pid, ready: ready && !closing });
         if (command === 'events') return json(res, store.eventsPage(url.searchParams.get('conversation_id'), {
           cursor: url.searchParams.get('cursor') ?? undefined,
           limit: url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50,

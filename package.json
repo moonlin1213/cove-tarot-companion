@@ -6,7 +6,7 @@
   "description": "Local consent-first companion connector for the original Tarot ritual engine",
   "engines": { "node": ">=24.5.0" },
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test --test-concurrency=1 test/*.test.mjs",
     "doctor": "node scripts/companion.mjs doctor",
     "serve": "node scripts/companion.mjs serve"
   }

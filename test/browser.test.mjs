@@ -11,6 +11,8 @@ import { Engine } from '../src/engine.mjs';
 import { Store } from '../src/store.mjs';
 import { createService } from '../src/server.mjs';
 import { writeConfig } from '../src/config.mjs';
+import { browserDiagnosticCode, formatBrowserSetupDiagnostic } from './browser-diagnostics.mjs';
+import { browserAcceptanceCases, browserLaunchOptions } from './browser-launch.mjs';
 
 const run = promisify(execFile);
 const engineRoot = process.env.TAROT_TEST_ENGINE_ROOT;
@@ -59,7 +61,7 @@ async function setup(t, browserName, mode) {
     await fs.rm(root, { recursive: true, force: true });
   });
   const executablePath = process.env[`TAROT_TEST_${browserName.toUpperCase()}_EXECUTABLE`];
-  browser = await playwright[browserName].launch({ headless: true, ...(executablePath ? { executablePath } : {}) });
+  browser = await playwright[browserName].launch({ ...browserLaunchOptions(browserName), ...(executablePath ? { executablePath } : {}) });
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
   const page = await context.newPage(); page.setDefaultTimeout(45000);
   // Never contact an external provider, even if a fixture accidentally changes.
@@ -67,7 +69,13 @@ async function setup(t, browserName, mode) {
     const url = new URL(route.request().url());
     return ['127.0.0.1', 'localhost'].includes(url.hostname) ? route.continue() : route.abort();
   });
-  const browserErrors = []; page.on('pageerror', error => browserErrors.push(error.message));
+  const browserErrors = []; const consoleErrors = [];
+  const recordError = (target, value) => {
+    const code = browserDiagnosticCode(value);
+    if (target.length < 4 && !target.includes(code)) target.push(code);
+  };
+  page.on('pageerror', error => recordError(browserErrors, error.message));
+  page.on('console', message => { if (['warning', 'error'].includes(message.type())) recordError(consoleErrors, message.text()); });
   const apiRequests = [];
   page.on('request', req => { if (new URL(req.url()).pathname.startsWith('/api/')) apiRequests.push({ route: new URL(req.url()).pathname, headers: req.headers() }); });
   const cli = async (...args) => JSON.parse((await run(process.execPath, [cliPath, ...args, '--data-dir', dataDir], { env: environment })).stdout);
@@ -78,7 +86,23 @@ async function setup(t, browserName, mode) {
   await capture(page, `${browserName}-${mode}-invitation.png`);
   await page.getByRole('button', { name: '接受并打开' }).click();
   await page.waitForURL('**/ritual/*');
-  await page.waitForFunction(() => window.__ritual?.cards.length === 78 && !document.querySelector('#beginBtn').disabled);
+  try { await page.waitForFunction(() => window.__ritual?.cards.length === 78 && !document.querySelector('#beginBtn').disabled); }
+  catch (error) {
+    let state = {};
+    try {
+      state = await page.evaluate(() => {
+        const ritual = window.__ritual;
+        const begin = document.querySelector('#beginBtn');
+        return {
+          ritualExists: Boolean(ritual),
+          cardCount: Array.isArray(ritual?.cards) ? ritual.cards.length : null,
+          beginState: !begin ? 'missing' : begin.disabled ? 'disabled' : 'enabled',
+        };
+      });
+    } catch { /* fixed missing-state diagnostic */ }
+    t.diagnostic(formatBrowserSetupDiagnostic({ url: page.url(), ...state, pageErrorCodes: browserErrors, consoleCodes: consoleErrors }));
+    throw error;
+  }
   t.diagnostic(`${browserName}/${mode}: original app initialized at /ritual/:id`);
   return { root, page, cli, conversation, invitation, browserErrors, apiRequests, requests, providerURL: `http://127.0.0.1:${upstream.address().port}/v1` };
 }
@@ -112,9 +136,8 @@ async function drawOriginal(f) {
   return result;
 }
 
-for (const browserName of ['chromium', 'webkit']) {
-  for (const mode of ['succeeded', 'providerless', 'failed']) {
-    test(`real ${browserName}: original UI ${mode}, saved refresh, return and persisted host receipt`, { skip: !enabled, timeout: 150000 }, async t => {
+for (const { browserName, mode } of browserAcceptanceCases()) {
+  test(`real ${browserName}: original UI ${mode}, saved refresh, return and persisted host receipt`, { skip: !enabled, timeout: 150000 }, async t => {
       const f = await setup(t, browserName, mode);
       if (mode !== 'providerless') await configureProvider(f);
       const drawn = await drawOriginal(f);
@@ -165,6 +188,5 @@ for (const browserName of ['chromium', 'webkit']) {
       assert.equal(f.requests.filter(r => r.route === '/v1/chat/completions').length, calls.length, 'refresh and repeated return must not rerun original reading');
       assert.deepEqual(f.browserErrors, []);
       t.diagnostic(`${browserName}/${mode}: 3-card original batch, refresh, one return event and persisted message ACK verified`);
-    });
-  }
+  });
 }

@@ -40,7 +40,46 @@ function ReadAttributes($candidate) {
   catch [UnauthorizedAccessException] { Fail 'COVE_TAROT_ACL_INSPECTION' 25 }
   catch { Fail 'COVE_TAROT_ACL_INSPECTION' 25 }
 }
+function AclReadFailureClass($record) {
+  $candidate = $record.Exception
+  for ($depth = 0; $null -ne $candidate -and $depth -lt 5; $depth++) {
+    switch ($candidate.GetType().FullName) {
+      'System.Management.Automation.CommandNotFoundException' { return 'COMMAND_MISSING' }
+      'System.UnauthorizedAccessException' { return 'UNAUTHORIZED' }
+      'System.Management.Automation.ItemNotFoundException' { return 'ITEM_NOT_FOUND' }
+      'System.IO.FileNotFoundException' { return 'ITEM_NOT_FOUND' }
+      'System.IO.DirectoryNotFoundException' { return 'ITEM_NOT_FOUND' }
+      'System.PlatformNotSupportedException' { return 'NOT_SUPPORTED' }
+      'System.NotSupportedException' { return 'NOT_SUPPORTED' }
+      'System.Management.Automation.PSNotSupportedException' { return 'NOT_SUPPORTED' }
+      'System.Security.SecurityException' { return 'SECURITY' }
+      'System.Security.AccessControl.PrivilegeNotHeldException' { return 'SECURITY' }
+    }
+    switch ([int]$candidate.HResult) {
+      -2147024891 { return 'UNAUTHORIZED' }
+      -2147024894 { return 'ITEM_NOT_FOUND' }
+      -2147024893 { return 'ITEM_NOT_FOUND' }
+      -2146233067 { return 'NOT_SUPPORTED' }
+      -2146233031 { return 'NOT_SUPPORTED' }
+      -2146233078 { return 'SECURITY' }
+      -2147023582 { return 'SECURITY' }
+    }
+    $candidate = $candidate.InnerException
+  }
+  switch ($record.CategoryInfo.Category.ToString()) {
+    'PermissionDenied' { return 'UNAUTHORIZED' }
+    'ObjectNotFound' { return 'ITEM_NOT_FOUND' }
+    'NotImplemented' { return 'NOT_SUPPORTED' }
+    'SecurityError' { return 'SECURITY' }
+  }
+  return 'OTHER'
+}
 $path = $env:COVE_TAROT_ACL_PATH
+$stage = 'UNKNOWN'
+if ($env:COVE_TAROT_ACL_ACTION -eq 'secure-directory') { $stage = 'DIRECTORY' }
+if ($env:COVE_TAROT_ACL_ACTION -eq 'secure-file') { $stage = 'FILE_SECURE' }
+if ($env:COVE_TAROT_ACL_ACTION -eq 'validate-file') { $stage = 'FILE_VALIDATE' }
+$operation = 'PATH'
 try {
   $fullPath = [IO.Path]::GetFullPath($path)
   $root = [IO.Path]::GetPathRoot($fullPath)
@@ -58,40 +97,59 @@ try {
   if ($drive.DriveType -eq [IO.DriveType]::Removable) { Fail 'COVE_TAROT_ACL_REMOVABLE' 23 }
   if ($drive.DriveType -ne [IO.DriveType]::Fixed) { Fail 'COVE_TAROT_ACL_VOLUME' 24 }
   if ($env:COVE_TAROT_ACL_ACTION -eq 'inspect') { exit 0 }
+  $operation = 'ITEM'
   $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+  $operation = 'ACL_READ'
   $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
+  $operation = 'IDENTITY'
   $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
   $current = $currentSid.Value
   $expected = @($current, 'S-1-5-18', 'S-1-5-32-544')
-  if ($env:COVE_TAROT_ACL_ACTION -eq 'secure-directory' -and -not $item.PSIsContainer) { Fail 'COVE_TAROT_ACL_UNSAFE' 24 }
-  if (($env:COVE_TAROT_ACL_ACTION -eq 'secure-file' -or $env:COVE_TAROT_ACL_ACTION -eq 'validate-file') -and $item.PSIsContainer) { Fail 'COVE_TAROT_ACL_UNSAFE' 24 }
+  $operation = 'VALIDATE'
+  if ($env:COVE_TAROT_ACL_ACTION -eq 'secure-directory' -and -not $item.PSIsContainer) { Fail 'COVE_TAROT_ACL_DIRECTORY_TYPE' 24 }
+  if (($env:COVE_TAROT_ACL_ACTION -eq 'secure-file' -or $env:COVE_TAROT_ACL_ACTION -eq 'validate-file') -and $item.PSIsContainer) { Fail "COVE_TAROT_ACL_$($stage)_TYPE" 24 }
   if ($env:COVE_TAROT_ACL_ACTION -like 'secure-*') {
+    $operation = 'PROTECT'
     $acl.SetAccessRuleProtection($true, $false)
+    $operation = 'CLEAR'
     foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleAll($rule) }
+    $operation = 'RULE_BUILD'
     if ($item.PSIsContainer) {
       $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
     } else {
       $inheritance = [Security.AccessControl.InheritanceFlags]::None
     }
     foreach ($identity in $expected) {
+      $operation = 'RULE_BUILD'
       $sid = New-Object Security.Principal.SecurityIdentifier($identity)
       $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+      $operation = 'RULE_ADD'
       [void]$acl.AddAccessRule($rule)
     }
+    $operation = 'OWNER_SET'
     $acl.SetOwner($currentSid)
+    $operation = 'ACL_WRITE'
     Set-Acl -LiteralPath $item.FullName -AclObject $acl -ErrorAction Stop
+    $operation = 'ACL_REREAD'
     $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
   }
-  if (-not $acl.AreAccessRulesProtected) { Fail 'COVE_TAROT_ACL_UNSAFE' 24 }
-  if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $current) { Fail 'COVE_TAROT_ACL_OWNER' 24 }
+  $operation = 'VALIDATE'
+  if (-not $acl.AreAccessRulesProtected) { Fail "COVE_TAROT_ACL_$($stage)_PROTECTION" 24 }
+  if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $current) { Fail "COVE_TAROT_ACL_$($stage)_OWNER" 24 }
   $rules = @($acl.Access | Where-Object { $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow })
-  if ($rules.Count -ne 3) { Fail 'COVE_TAROT_ACL_UNSAFE' 24 }
+  if ($rules.Count -ne 3) { Fail "COVE_TAROT_ACL_$($stage)_RULE_COUNT" 24 }
   foreach ($identity in $expected) {
     $rule = @($rules | Where-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $identity })
-    if ($rule.Count -ne 1 -or (($rule[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl)) { Fail 'COVE_TAROT_ACL_UNSAFE' 24 }
+    if ($rule.Count -ne 1) { Fail "COVE_TAROT_ACL_$($stage)_IDENTITY" 24 }
+    if (($rule[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl) { Fail "COVE_TAROT_ACL_$($stage)_RIGHTS" 24 }
   }
 } catch {
-  Fail 'COVE_TAROT_ACL_UNSAFE' 24
+  if ($operation -eq 'ACL_READ') {
+    $exceptionClass = 'OTHER'
+    try { $exceptionClass = AclReadFailureClass $_ } catch { $exceptionClass = 'OTHER' }
+    Fail "COVE_TAROT_ACL_$($stage)_UNEXPECTED_ACL_READ_$($exceptionClass)" 24
+  }
+  Fail "COVE_TAROT_ACL_$($stage)_UNEXPECTED_$($operation)" 24
 }
 `;
 
@@ -352,7 +410,7 @@ export async function assertManagedDestination(target, options = {}) {
   const api = platform === 'win32' ? path.win32 : path.posix;
   const resolved = nativePath(target, platform);
   await assertLocalPath(resolved, options);
-  if (platform === 'win32') await windowsAcl(resolved, 'inspect');
+  if (platform === 'win32') await runWindowsAcl(resolved, 'inspect');
   await assertNoLinks(resolved, platform);
 
   const missing = [];
@@ -389,34 +447,46 @@ async function assertPosixFile(filename) {
   return stat;
 }
 
-async function windowsAcl(filename, action) {
-  try {
-    await execFile('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', WINDOWS_ACL_PROGRAM], {
-      env: { ...process.env, COVE_TAROT_ACL_PATH: filename, COVE_TAROT_ACL_ACTION: action },
-      windowsHide: true,
-      maxBuffer: 64 * 1024,
-    });
-  } catch (error) {
-    if (error?.code === 'ENOENT') throw new Error('PowerShell is required to verify Windows private storage');
-    const category = /COVE_TAROT_ACL_(REPARSE|NETWORK|REMOVABLE|VOLUME|OWNER|UNSAFE|INSPECTION)/.exec(String(error?.stderr || ''))?.[1];
-    if (category === 'REPARSE') throw new Error('Private storage path contains a reparse point');
-    if (category === 'INSPECTION') throw new Error('Private storage path could not be inspected safely');
-    if (category === 'NETWORK') throw new Error('Private storage is on a network volume; choose a local fixed --data-dir');
-    if (category === 'REMOVABLE' || category === 'VOLUME') throw new Error('Private storage must use a local fixed --data-dir');
-    if (category === 'OWNER' || category === 'UNSAFE') throw new Error('Private storage ACL or owner is unsafe');
-    throw new Error('Private storage ACL could not be secured or verified');
+export function windowsAclFailure(stderr) {
+  const category = /COVE_TAROT_ACL_((?:(?:DIRECTORY|FILE_SECURE|FILE_VALIDATE|UNKNOWN)_(?:(?:UNEXPECTED_ACL_READ_(?:COMMAND_MISSING|UNAUTHORIZED|ITEM_NOT_FOUND|NOT_SUPPORTED|SECURITY|OTHER))|(?:UNEXPECTED_(?:PATH|ITEM|ACL_READ|IDENTITY|VALIDATE|PROTECT|CLEAR|RULE_BUILD|RULE_ADD|OWNER_SET|ACL_WRITE|ACL_REREAD))|TYPE|PROTECTION|OWNER|RULE_COUNT|IDENTITY|RIGHTS|UNEXPECTED))|REPARSE|NETWORK|REMOVABLE|VOLUME|OWNER|UNSAFE|INSPECTION)/.exec(String(stderr || ''))?.[1];
+  if (category === 'REPARSE') return new Error('Private storage path contains a reparse point');
+  if (category === 'INSPECTION') return new Error('Private storage path could not be inspected safely');
+  if (category === 'NETWORK') return new Error('Private storage is on a network volume; choose a local fixed --data-dir');
+  if (category === 'REMOVABLE' || category === 'VOLUME') return new Error('Private storage must use a local fixed --data-dir');
+  if (category === 'OWNER' || category === 'UNSAFE') return new Error('Private storage ACL or owner is unsafe');
+  if (category) return new Error(`Private storage ACL or owner is unsafe (ACL_${category})`);
+  return new Error('Private storage ACL could not be secured or verified');
+}
+
+export async function runWindowsAcl(filename, action, { execute = execFile } = {}) {
+  const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', WINDOWS_ACL_PROGRAM];
+  const options = {
+    env: { ...process.env, COVE_TAROT_ACL_PATH: filename, COVE_TAROT_ACL_ACTION: action },
+    windowsHide: true,
+    shell: false,
+    maxBuffer: 64 * 1024,
+  };
+  for (const host of ['pwsh.exe', 'powershell.exe']) {
+    try {
+      await execute(host, args, options);
+      return;
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw windowsAclFailure(error?.stderr);
+    }
   }
+  throw new Error('PowerShell 7 or Windows PowerShell is required to verify Windows private storage');
 }
 
 export async function ensurePrivateDirectory(directory, options = {}) {
   const { platform = process.platform } = options;
   directory = nativePath(directory, platform);
   await assertLocalPath(directory, options);
-  if (platform === 'win32') await windowsAcl(directory, 'inspect');
+  if (platform === 'win32') await runWindowsAcl(directory, 'inspect');
   else await assertNoLinks(directory, platform);
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
   if (platform === 'win32') {
-    await windowsAcl(directory, 'secure-directory');
+    await runWindowsAcl(directory, 'secure-directory');
   } else {
     await assertNoLinks(directory, platform);
     await fs.chmod(directory, 0o700);
@@ -431,10 +501,10 @@ async function openPrivateFile(filename, options = {}) {
   await assertLocalPath(filename, options);
   let before;
   if (platform === 'win32') {
-    await windowsAcl(filename, 'inspect');
+    await runWindowsAcl(filename, 'inspect');
     before = await fs.lstat(filename);
     if (!before.isFile() || before.isSymbolicLink()) throw new Error('Secret must be a regular file, not a link');
-    await windowsAcl(filename, 'validate-file');
+    await runWindowsAcl(filename, 'validate-file');
   } else {
     await assertNoLinks(filename, platform);
     before = await assertPosixFile(filename);
@@ -451,7 +521,7 @@ async function openPrivateFile(filename, options = {}) {
 async function verifyPrivateFileAfterOpen({ file, filename, before, platform }) {
   const after = await fs.lstat(filename);
   if (!after.isFile() || after.isSymbolicLink() || identifier(after) !== identifier(before)) throw new Error('Secret changed while being read');
-  if (platform === 'win32') await windowsAcl(filename, 'validate-file');
+  if (platform === 'win32') await runWindowsAcl(filename, 'validate-file');
   else await assertPosixFile(filename);
   await file.stat();
 }
@@ -473,11 +543,11 @@ export async function securePrivateFile(filename, options = {}) {
   const { platform = process.platform } = options;
   filename = nativePath(filename, platform);
   await assertLocalPath(filename, options);
-  if (platform === 'win32') await windowsAcl(filename, 'inspect');
+  if (platform === 'win32') await runWindowsAcl(filename, 'inspect');
   else await assertNoLinks(filename, platform);
   const stat = await fs.lstat(filename);
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Secret must be a regular file, not a link');
-  if (platform === 'win32') await windowsAcl(filename, 'secure-file');
+  if (platform === 'win32') await runWindowsAcl(filename, 'secure-file');
   else await fs.chmod(filename, 0o600);
   await assertPrivateFile(filename, { platform });
 }

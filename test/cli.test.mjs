@@ -10,7 +10,8 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { writeConfig } from '../src/config.mjs';
 import { Store } from '../src/store.mjs';
-import { applyPrivateUmask, assertPrivateDatabaseFiles, ensurePrivateDirectory, securePrivateFile } from '../src/platform.mjs';
+import { createService } from '../src/server.mjs';
+import { applyPrivateUmask, assertPrivateDatabaseFiles, ensurePrivateDirectory, removeWithRetry, securePrivateFile } from '../src/platform.mjs';
 import { probeService, ensureService, main } from '../scripts/companion.mjs';
 
 const run = promisify(execFile);
@@ -18,6 +19,7 @@ const script = fileURLToPath(new URL('../scripts/companion.mjs', import.meta.url
 
 async function broadenPrivateFile(filename) {
   if (process.platform !== 'win32') return fs.chmod(filename, 0o644);
+  const { runWindowsPowerShell } = await import('./windows-powershell.mjs');
   const program = String.raw`
 $ErrorActionPreference = 'Stop'
 $acl = Get-Acl -LiteralPath $env:COVE_TAROT_TEST_ACL_PATH
@@ -26,9 +28,7 @@ $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, [Security.A
 [void]$acl.AddAccessRule($rule)
 Set-Acl -LiteralPath $env:COVE_TAROT_TEST_ACL_PATH -AclObject $acl
 `;
-  await run('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', program], {
-    env: { ...process.env, COVE_TAROT_TEST_ACL_PATH: filename }, windowsHide: true,
-  });
+  await runWindowsPowerShell(program, { ...process.env, COVE_TAROT_TEST_ACL_PATH: filename });
 }
 
 test('private umask applies only to POSIX processes', () => {
@@ -75,6 +75,98 @@ test('detached service launch preserves Unicode arguments and uses the owned hid
     detached: true, stdio: 'ignore', env: process.env, shell: false, windowsHide: true,
   }]]);
 });
+test('service readiness polling accepts an injected pause without changing its probe contract', async () => {
+  const child = new EventEmitter(); child.unref = () => {};
+  const pauses = []; let probes = 0;
+  await ensureService({ executable: process.execPath, dataDir: '/synthetic' }, {
+    probe: async () => (++probes === 1 ? null : { ready: true }),
+    spawnImplementation: () => child,
+    pauseImplementation: async milliseconds => { pauses.push(milliseconds); },
+  });
+  assert.deepEqual(pauses, [50]);
+  assert.equal(probes, 2);
+});
+test('Windows service startup waits thirty seconds for its authenticated initializing owner', async () => {
+  const child = new EventEmitter(); child.unref = () => {};
+  let elapsed = 0; let probes = 0; let spawns = 0;
+  await ensureService({ executable: process.execPath, dataDir: '/synthetic' }, {
+    platform: 'win32',
+    clock: () => elapsed,
+    pauseImplementation: async milliseconds => { elapsed += milliseconds; },
+    probe: async () => {
+      probes++;
+      return { ready: probes > 1 && elapsed >= 30_000 };
+    },
+    spawnImplementation: () => { spawns++; return child; },
+  });
+  assert.equal(elapsed, 30_000);
+  assert.equal(probes, 601);
+  assert.equal(spawns, 0);
+});
+test('service readiness exhaustion is bounded at thirty seconds on Windows and five elsewhere', async () => {
+  for (const [platform, expectedElapsed, expectedProbes] of [['win32', 30_000, 601], ['linux', 5_000, 101]]) {
+    const child = new EventEmitter(); child.unref = () => {};
+    let elapsed = 0; let probes = 0;
+    await assert.rejects(ensureService({ executable: process.execPath, dataDir: '/synthetic' }, {
+      platform,
+      clock: () => elapsed,
+      pauseImplementation: async milliseconds => { elapsed += milliseconds; },
+      probe: async () => { probes++; return { ready: false }; },
+      spawnImplementation: () => child,
+    }), /could not start/);
+    assert.equal(elapsed, expectedElapsed, platform);
+    assert.equal(probes, expectedProbes, platform);
+  }
+});
+test('service startup waits beyond the former identity grace for its authenticated initializing owner', async () => {
+  const reservation = http.createServer(); await new Promise(resolve => reservation.listen(0, '127.0.0.1', resolve));
+  const servicePort = reservation.address().port; await new Promise(resolve => reservation.close(resolve));
+  const config = {
+    executable: process.execPath,
+    dataDir: path.join(os.tmpdir(), 'synthetic-companion-data'),
+    servicePort,
+    origin: `http://127.0.0.1:${servicePort}`,
+    adminToken: 'synthetic-admin',
+    installationId: 'synthetic-installation',
+  };
+  let enteredResolve; const entered = new Promise(resolve => { enteredResolve = resolve; });
+  let releaseResolve; const release = new Promise(resolve => { releaseResolve = resolve; });
+  const child = new EventEmitter(); child.unref = () => {};
+  let servicePromise; let service; let timer;
+  try {
+    const waiting = ensureService(config, { spawnImplementation: () => {
+      servicePromise = createService({ config, engine: { close: async () => {} }, store: async () => {
+        enteredResolve(); await release; return { close() {} };
+      } });
+      return child;
+    } });
+    await entered;
+    const started = Date.now();
+    timer = setTimeout(releaseResolve, 700);
+    await waiting;
+    assert.ok(Date.now() - started >= 650, 'startup must still be waiting after the former 550 ms grace');
+    service = await servicePromise;
+    assert.equal((await probeService(config)).ready, true);
+  } finally {
+    clearTimeout(timer); releaseResolve();
+    try { service ??= await servicePromise; } catch {}
+    await service?.close();
+  }
+});
+test('service startup fails on the first genuine identity mismatch after spawning', async () => {
+  const child = new EventEmitter(); child.unref = () => {};
+  let probes = 0; let spawns = 0;
+  await assert.rejects(ensureService({ executable: process.execPath, dataDir: '/synthetic' }, {
+    probe: async () => {
+      probes++;
+      if (probes === 1) return null;
+      throw new Error('Local service identity does not match this installation');
+    },
+    spawnImplementation: () => { spawns++; return child; },
+  }), /identity does not match/);
+  assert.equal(spawns, 1);
+  assert.equal(probes, 2);
+});
 test('service identity probing cancels oversized streaming replies without buffering indefinitely', async () => {
   const previous = globalThis.fetch; let cancelled = false;
   globalThis.fetch = async () => new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('x'.repeat(5000))); }, cancel() { cancelled = true; } }));
@@ -111,18 +203,23 @@ test('malformed private config never quotes a synthetic credential in CLI or upd
   await assert.rejects(writeConfig(dataDir, { engineRoot: root }), error => !error.message.includes(syntheticSecret) && /Invalid private configuration/.test(error.message));
 });
 
-test('administrative CLI replies are byte bounded and oversized open bodies are cancelled', async t => {
+test('administrative CLI replies are byte bounded and oversized open bodies are cancelled', { timeout: 60_000 }, async t => {
   const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'companion-admin-body-')));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const config = await writeConfig(path.join(root, 'data'), { engineRoot: root });
-  const previous = globalThis.fetch; let cancelled = false; let status = 200;
-  globalThis.fetch = async url => String(url).endsWith('/health')
-    ? Response.json({ protocol: 'cove-tarot-companion-v1', installation_id: config.installationId })
-    : new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(131073)); }, cancel() { cancelled = true; } }), { status });
+  const previous = globalThis.fetch; let cancelled = false; let status = 200; let bodyEntered;
+  globalThis.fetch = async url => {
+    if (String(url).endsWith('/health')) return Response.json({ protocol: 'cove-tarot-companion-v1', installation_id: config.installationId });
+    bodyEntered();
+    return new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(131073)); }, cancel() { cancelled = true; } }), { status });
+  };
   try {
     for (status of [200, 403]) {
-      cancelled = false;
-      const result = await Promise.race([main(['events', '--conversation', 'chat', '--data-dir', config.dataDir]).then(() => 'accepted', () => 'rejected'), new Promise(r => setTimeout(() => r('unbounded'), 200))]);
+      cancelled = false; let releaseBody;
+      const entered = new Promise(resolve => { releaseBody = resolve; }); bodyEntered = releaseBody;
+      const operation = main(['events', '--conversation', 'chat', '--data-dir', config.dataDir]).then(() => 'accepted', () => 'rejected');
+      assert.equal(await Promise.race([entered.then(() => 'entered'), operation]), 'entered');
+      const result = await Promise.race([operation, new Promise(r => setTimeout(() => r('unbounded'), 200))]);
       assert.equal(result, 'rejected'); assert.equal(cancelled, true);
     }
   } finally { globalThis.fetch = previous; }
@@ -154,8 +251,12 @@ async function fixture(t) {
   const servicePort = socket.address().port; await new Promise(r => socket.close(r));
   const config = await writeConfig(path.join(root, 'data'), { engineRoot: root, servicePort, enginePort: servicePort === 65535 ? 18643 : servicePort + 1 });
   const env = { ...process.env, HOME: root, TAROT_DSH_DIR: root };
-  const cli = (...args) => run(process.execPath, [script, ...args, '--data-dir', config.dataDir], { env, timeout: 15000 });
-  t.after(async () => { try { await cli('stop-service'); } catch {} await fs.rm(root, { recursive: true, force: true }); });
+  const cli = (...args) => run(process.execPath, [script, ...args, '--data-dir', config.dataDir], { env, timeout: process.platform === 'win32' ? 60_000 : 15_000 });
+  t.after(async () => {
+    await cli('stop-service');
+    if (process.platform === 'win32') await removeWithRetry(root, { recursive: true, force: true, timeout: 5_000, maxAttempts: 50, retryDelay: 100 });
+    else await fs.rm(root, { recursive: true, force: true });
+  });
   return { root, config, cli };
 }
 
@@ -204,9 +305,13 @@ test('an occupied wrong-identity service cannot cause CLI to recover a running d
   db.claimReading(invitation.id, { action_id: 'charge', model: 'test' });
   const other = http.createServer((req, res) => res.end('{"protocol":"wrong"}'));
   await new Promise(r => other.listen(config.servicePort, '127.0.0.1', r));
-  t.after(() => { db.close(); return new Promise(r => other.close(r)); });
-  await assert.rejects(cli('invite', '--conversation', 'chat', '--manual'), /occupied|identity|authenticate/i);
-  assert.equal(db.session(invitation.id).reading.state, 'running');
+  try {
+    await assert.rejects(cli('invite', '--conversation', 'chat', '--manual'), /occupied|identity|authenticate/i);
+    assert.equal(db.session(invitation.id).reading.state, 'running');
+  } finally {
+    db.close();
+    await new Promise((resolve, reject) => other.close(error => error ? reject(error) : resolve()));
+  }
 });
 
 test('spawned CLI events preserves the paginated envelope and follows explicit cursors without loss', async t => {

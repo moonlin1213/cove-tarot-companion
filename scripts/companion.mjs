@@ -27,22 +27,36 @@ export async function probeService(config) {
     }
     const text = Buffer.concat(chunks).toString('utf8');
     const health = JSON.parse(text);
-    if (health.protocol !== 'cove-tarot-companion-v1' || health.installation_id !== config.installationId) throw new Error();
+    if (health.protocol !== 'cove-tarot-companion-v1' || health.installation_id !== config.installationId
+      || (health.ready !== undefined && typeof health.ready !== 'boolean')) throw new Error();
     return health;
   } catch { throw new Error('Local service identity does not match this installation'); }
 }
-export async function ensureService(config, { platform = process.platform, probe = probeService, spawnImplementation } = {}) {
-  if (await probe(config)) return;
+export async function ensureService(config, {
+  platform = process.platform,
+  probe = probeService,
+  spawnImplementation,
+  pauseImplementation = pause,
+  clock = Date.now,
+} = {}) {
+  const usable = health => health && health.ready !== false;
+  const existing = await probe(config);
+  if (usable(existing)) return;
   // Competing children race only for the fixed socket. Losing children never
   // construct Store and cannot perform recovery over the winner's live work.
-  const child = spawnOwned(config.executable, [fileURLToPath(import.meta.url), 'serve', '--data-dir', config.dataDir], {
-    detached: true, stdio: 'ignore', env: process.env, platform, spawnImplementation,
-  });
-  let failed = false; child.once('error', () => { failed = true; }); child.unref();
-  for (let i = 0; i < 100 && !failed; i++) {
-    await pause(50);
-    try { if (await probe(config)) return; }
-    catch (error) { if (i > 10) throw error; }
+  let failed = false;
+  if (!existing) {
+    const child = spawnOwned(config.executable, [fileURLToPath(import.meta.url), 'serve', '--data-dir', config.dataDir], {
+      detached: true, stdio: 'ignore', env: process.env, platform, spawnImplementation,
+    });
+    child.once('error', () => { failed = true; }); child.unref();
+  }
+  const deadline = clock() + (platform === 'win32' ? 30_000 : 5_000);
+  while (!failed) {
+    const remaining = deadline - clock();
+    if (remaining <= 0) break;
+    await pauseImplementation(Math.min(50, remaining));
+    if (usable(await probe(config))) return;
   }
   throw new Error('Local service could not start; run serve to inspect the configuration');
 }

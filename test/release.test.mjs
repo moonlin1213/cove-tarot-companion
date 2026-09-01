@@ -25,12 +25,63 @@ async function scan(options) {
   assert.equal(await fs.stat(scannerURL).then(() => true, () => false), true, 'release scanner must exist');
   return (await import(scannerURL)).checkRelease(options);
 }
+async function nativeWorkflow() {
+  return fs.readFile(path.join(projectRoot, '.github', 'workflows', 'test.yml'), 'utf8');
+}
+function workflowStep(source, name) {
+  const marker = `      - name: ${name}`;
+  const start = source.indexOf(marker);
+  assert.notEqual(start, -1, `${name} step must exist`);
+  const end = source.indexOf('\n      - ', start + marker.length);
+  return source.slice(start, end < 0 ? undefined : end);
+}
+
+test('public test command bounds native file concurrency to one', async () => {
+  const manifest = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
+  assert.match(manifest.scripts.test, /(?:^|\s)--test-concurrency=1(?:\s|$)/);
+});
+
+test('native workflow retains the Windows installer and a bounded installed lifecycle smoke', async () => {
+  const workflow = await nativeWorkflow();
+  const installer = workflowStep(workflow, 'Install exact public engine through the user installer (PowerShell)');
+  assert.match(installer, /if: runner\.os == 'Windows'/);
+  assert.match(installer, /RUNNER_TEMP[\s\S]*companion-skill[\s\S]*companion-data[\s\S]*scripts\/install\.mjs/);
+
+  const lifecycle = workflowStep(workflow, 'Windows installed providerless lifecycle smoke');
+  assert.match(lifecycle, /if: runner\.os == 'Windows'/);
+  const timeout = Number(/timeout-minutes:\s*(\d+)/.exec(lifecycle)?.[1]);
+  assert.ok(timeout >= 1 && timeout <= 10, 'Windows lifecycle smoke must have a bounded outer timeout');
+  assert.match(lifecycle, /RUNNER_TEMP[\s\S]*companion-skill[\s\S]*companion-data/);
+  for (const command of ['doctor', 'invite', '--manual', 'stop-service']) assert.ok(lifecycle.includes(command), command);
+});
+
+test('native workflow reserves full and browser regressions for non-Windows while retaining Windows security boundaries', async () => {
+  const workflow = await nativeWorkflow();
+  const boundaries = workflowStep(workflow, 'Windows fail-closed boundary regressions');
+  assert.match(boundaries, /if: runner\.os == 'Windows'/);
+  assert.match(boundaries, /ACL host selection[\s\S]*Windows service startup waits thirty[\s\S]*Windows replacement retries/);
+  assert.match(workflowStep(workflow, 'Full regression with actual installed engine'), /if: runner\.os != 'Windows'/);
+  assert.match(workflowStep(workflow, 'Install isolated browser test dependency'), /if: runner\.os != 'Windows'/);
+  assert.match(workflowStep(workflow, 'Selected real browser original UI gates'), /if: runner\.os != 'Windows'/);
+  assert.doesNotMatch(workflow, /name: Install Chromium and WebKit on Windows/);
+});
 
 test('clean exact public source and project metadata pass without exposing matches', async t => {
   const f = await fixture(t);
   const result = await scan({ cwd: f.root, expectedCommit: 'a'.repeat(40) });
   assert.deepEqual(result.findings, []); assert.equal(result.ok, true);
   assert.ok(result.commits >= 1); assert.ok(result.blobs >= 1);
+});
+
+test('the public repository owner GitHub noreply identity is accepted', async t => {
+  const f = await fixture(t);
+  f.git('config', 'user.name', 'moonlin1213');
+  f.git('config', 'user.email', 'moonlin1213@users.noreply.github.com');
+  await f.write('owner-authored.txt', 'public owner-authored change');
+  f.commit();
+  const result = await scan({ cwd: f.root });
+  assert.equal(result.ok, true);
+  assert.equal(result.findings.some(finding => finding.rule === 'commit-identity'), false);
 });
 
 test('tracked content detects synthetic credentials, private paths, terms and network addresses', async t => {

@@ -7,8 +7,10 @@ import { execFileSync } from 'node:child_process';
 const SOURCE = 'https://github.com/moonlin1213/tarot-ritual.git';
 const PUBLIC_URLS = new Set([SOURCE, SOURCE.replace(/\.git$/, ''),
   'https://github.com/moonlin1213/cove-tarot-companion.git', 'https://github.com/moonlin1213/cove-tarot-companion']);
-const NAME = 'Cove Contributors';
-const EMAIL = 'contributors@users.noreply.github.com';
+const PUBLIC_IDENTITIES = new Set([
+  'Cove Contributors\0contributors@users.noreply.github.com',
+  'moonlin1213\0moonlin1213@users.noreply.github.com'
+]);
 const PRIVATE_FILE = /(?:^|\/)(?:\.env(?:\..+)?|config\.json|[^/]*\.sqlite(?:-wal|-shm)?|[^/]*\.log|\.superpowers(?:\/|$)|\.DS_Store$)/;
 const RULES = [
   ['credential', /\b(?:sk-[A-Za-z0-9_-]{24,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AKIA[A-Z0-9]{16})\b|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/],
@@ -83,7 +85,7 @@ export async function checkRelease({ cwd = process.cwd(), privateTerms = [], exp
   const commits = git('rev-list', base ? `${base}..HEAD` : 'HEAD').trim().split('\n').filter(Boolean);
   for (const commit of commits) {
     const [author, authorEmail, committer, committerEmail, message] = git('show', '-s', '--format=%an%x00%ae%x00%cn%x00%ce%x00%B', commit).split('\0');
-    if (author !== NAME || authorEmail !== EMAIL || committer !== NAME || committerEmail !== EMAIL) add('commit-identity', `commit:${commit}`);
+    if (!PUBLIC_IDENTITIES.has(`${author}\0${authorEmail}`) || !PUBLIC_IDENTITIES.has(`${committer}\0${committerEmail}`)) add('commit-identity', `commit:${commit}`);
     scan([author, authorEmail, committer, committerEmail, message].join('\n'), `commit:${commit}`);
     const entries = git('ls-tree', '-rz', commit).split('\0').filter(Boolean);
     for (let i = 0; i < entries.length; i++) {
